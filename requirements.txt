@@ -1,0 +1,6 @@
+numpy>=2.0,<3
+pandas>=2.2,<3
+geopandas>=1.0,<2
+pyogrio>=0.9,<1
+pyarrow>=17,<22
+shapely>=2.0,<3
