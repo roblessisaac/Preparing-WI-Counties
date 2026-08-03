@@ -1,0 +1,7 @@
+
+# Large GIS source and generated files
+data/source/*.zip
+data/output/
+*.parquet
+*.gpkg
+*.gdb
