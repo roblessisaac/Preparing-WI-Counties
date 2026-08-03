@@ -765,7 +765,9 @@ class WisconsinStatewideNG911Adapter:
             frame.insert(0, "Source_FID", pd.Series(range(len(frame)), dtype="int64"))
         if frame.crs is None:
             frame = frame.set_crs(self.metadata.crs)
-        if str(frame.crs).upper() != "EPSG:4326":
+        if frame.crs is None:
+            raise ValidationError("County source has no CRS.")
+        if frame.crs.to_epsg() != 4326:
             frame = frame.to_crs("EPSG:4326")
         return frame
 
@@ -1520,7 +1522,7 @@ def validate_full_fidelity(
         raise ValidationError("Full-fidelity NGUID set does not match source")
     if geometry_map(source) != geometry_map(output_identity):
         raise ValidationError("Full-fidelity geometry hash map does not match source")
-    if str(output_identity.crs).upper() != "EPSG:4326":
+    if output_identity.crs is None or output_identity.crs.to_epsg() != 4326:
         raise ValidationError(f"Full-fidelity CRS mismatch: {output_identity.crs}")
     if len(source):
         if not np.allclose(source.total_bounds, output_identity.total_bounds, equal_nan=True, atol=1e-12):
@@ -1554,7 +1556,7 @@ def validate_runtime(
     record_ids = clean_series(output, "Source_Record_ID")
     if record_ids.eq("").any() or not record_ids.is_unique:
         raise ValidationError("Runtime Source_Record_ID is missing or non-unique")
-    if str(output.crs).upper() != "EPSG:4326":
+    if output.crs is None or output.crs.to_epsg() != 4326:
         raise ValidationError(f"Runtime CRS mismatch: {output.crs}")
     bbox_validated = False
     if covering_bbox_written and not runtime.empty:
