@@ -68,9 +68,11 @@ import re
 import shutil
 import sys
 import tempfile
+import time
+import traceback
 import unicodedata
 import zipfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
@@ -127,6 +129,12 @@ DEFAULT_WISCONSIN_BOUNDS = (-93.25, 42.30, -86.65, 47.25)
 MAX_DETAIL_REPORT_ROWS_PER_COUNTY = 5_000
 HASH_CHUNK_SIZE = 8 * 1024 * 1024
 
+PIPELINE_VERSION = "2.1.0"
+RUNTIME_SCHEMA_VERSION = "2.1.0"
+FULL_FIDELITY_SCHEMA_VERSION = "1.1.0"
+MANIFEST_SCHEMA_VERSION = "2.1.0"
+CLASSIFICATION_RULE_VERSION = "2.1.0"
+
 WI_COUNTIES: tuple[str, ...] = (
     "Adams", "Ashland", "Barron", "Bayfield", "Brown", "Buffalo",
     "Burnett", "Calumet", "Chippewa", "Clark", "Columbia", "Crawford",
@@ -142,26 +150,31 @@ WI_COUNTIES: tuple[str, ...] = (
     "Washington", "Waukesha", "Waupaca", "Waushara", "Winnebago", "Wood",
 )
 
-STATUS_OVERRIDES: dict[str, tuple[str, str]] = {
-    "Waukesha": (
-        "validated",
-        "Statewide records were previously reconciled against Waukesha County data.",
-    ),
-    "Milwaukee": (
-        "county_override",
-        "The statewide layer is missing nearly all City of Milwaukee addresses; use the county-specific source.",
-    ),
-    "Crawford": (
-        "incomplete",
-        "The statewide source snapshot contains only one Crawford County record.",
-    ),
-    "Iowa": ("unavailable", "County is absent from the statewide source snapshot."),
-    "Kewaunee": ("unavailable", "County is absent from the statewide source snapshot."),
-    "Lafayette": ("unavailable", "County is absent from the statewide source snapshot."),
-    "Langlade": ("unavailable", "County is absent from the statewide source snapshot."),
-    "Oneida": ("unavailable", "County is absent from the statewide source snapshot."),
-    "Taylor": ("unavailable", "County is absent from the statewide source snapshot."),
-    "Vilas": ("unavailable", "County is absent from the statewide source snapshot."),
+COUNTY_STATUS_OVERRIDES: dict[str, dict[str, Any]] = {
+    "Waukesha": {
+        "coverage_readiness_status": "validated",
+        "production_source_status": "statewide_runtime",
+        "public_availability_status": "validated",
+        "reason": "Statewide records were previously reconciled against the Waukesha County source.",
+        "recommended_source": "Wisconsin statewide NG911 runtime",
+    },
+    "Milwaukee": {
+        "coverage_readiness_status": "incomplete_coverage",
+        "production_source_status": "county_override",
+        "public_availability_status": "county_override",
+        "reason": (
+            "The statewide layer is missing nearly all City of Milwaukee addresses; "
+            "use the county-specific source."
+        ),
+        "recommended_source": "Milwaukee County-specific dataset",
+    },
+    "Crawford": {
+        "coverage_readiness_status": "incomplete_coverage",
+        "production_source_status": "incomplete_coverage",
+        "public_availability_status": "incomplete_coverage",
+        "reason": "The statewide source snapshot contains only one Crawford County record.",
+        "recommended_source": None,
+    },
 }
 
 REQUIRED_SOURCE_FIELDS: tuple[str, ...] = (
@@ -189,64 +202,207 @@ CURRENT_ANALYZER_COLUMNS: tuple[str, ...] = (
     "Canonical_Native_Source_ID", "geometry",
 )
 
-RUNTIME_COLUMNS: tuple[str, ...] = (
-    # Source and identity
-    "Source_System", "Source_Version", "Source_FID", "Source_County",
-    "Source_State", "Canonical_County", "Canonical_Native_Source_ID",
-    "Source_Record_ID", "NGUID", "RCL_NGUID",
-    # House number
-    "AddNum_Pre", "Add_Number", "AddNum_Suf", "Canonical_HouseNoPrefix",
-    "Canonical_HouseNo", "Canonical_HouseSx", "Canonical_Full_House_Number",
-    # Street
-    "St_PreMod", "St_PreDir", "St_PreTyp", "St_PreSep", "St_Name",
-    "St_PosTyp", "St_PosDir", "St_PosMod", "FullStNm", "abFullStNm",
-    "Canonical_Street_PreModifier", "Canonical_Dir",
-    "Canonical_Street_PreType", "Canonical_Street_PreSeparator",
-    "Canonical_Street", "Canonical_StType", "Canonical_SuffixDir",
-    "Canonical_Street_PostModifier", "Canonical_Full_Street",
-    "Canonical_Abbreviated_Street", "Canonical_Street_Component_Fallback",
-    # Units and subaddresses
-    "Unit_PreType", "Unit_Value", "Building", "Floor", "Room", "Seat",
-    "Addtl_Loc", "Canonical_UnitType", "Canonical_Unit",
-    "Canonical_Building", "Canonical_Floor", "Canonical_Room",
-    "Canonical_Seat", "Canonical_Additional_Location",
-    "Canonical_Subaddress", "Canonical_Occupancy_Key",
-    "Canonical_Unit_Category", "Canonical_Unit_Classification_Confidence",
-    # Locality and postal
-    "Inc_Muni", "Uninc_Comm", "Nbrhd_Comm", "MSAGComm", "Post_Comm",
-    "Post_Code", "Post_Code4", "Canonical_Muni", "Canonical_Postal_City",
-    "Canonical_Incorporated_Municipality",
-    "Canonical_Unincorporated_Community", "Canonical_Neighborhood",
-    "Canonical_MSAG_Community", "Canonical_Locality_Source",
-    "Canonical_Postal_City_Fallback_Flag", "Canonical_Zip_Code",
-    "Canonical_ZIP4", "Canonical_Full_ZIP", "Canonical_ZIP_Quality_Flag",
-    # Classification and landmarks
-    "LandmkName", "Place_Type", "Placement", "Structure", "Exception",
-    "Canonical_Landmark_Name", "Source_Place_Type", "Source_Placement",
-    "Source_Structure", "Source_Exception", "Canonical_Record_Role",
-    "Canonical_Record_Role_Confidence", "Canonical_Record_Role_Reasons",
-    "Canonical_Status",
-    # Dates and eligibility
-    "DateUpdate", "Effective", "Expire", "DateUpdate_Raw",
-    "DateUpdate_Parsed", "Effective_Raw", "Effective_Parsed", "Expire_Raw",
-    "Expire_Parsed", "Canonical_Active_Status",
-    "Canonical_Eligibility_Status", "Canonical_Date_Quality_Flags",
-    # Address and grouping
-    "Canonical_Full_Address", "Canonical_Mailable_Address",
-    "Normalized_Address_Key", "Normalized_Address_Without_Unit_Key",
-    "Normalized_Building_Address_Key", "Potential_Parent_Record",
-    "Potential_Child_Record", "Parent_Group_Key", "Child_Record_Count",
-    "Parent_Child_Confidence", "Potential_Double_Count_Flag",
-    # Occupancy
-    "Canonical_Occupancy_Category", "Canonical_Residential_Unit_Flag",
-    "Canonical_Commercial_Unit_Flag", "Canonical_Apartment_Candidate_Flag",
-    "Canonical_Occupancy_Confidence", "Canonical_Occupancy_Reasons",
-    # QA and geometry
-    "Canonical_Quality_Flags", "Canonical_Address_Quality_Status",
-    "Canonical_Geometry_Quality_Status",
-    "Canonical_Classification_Quality_Status", "Canonical_Postal_Quality_Status",
-    "Canonical_Latitude", "Canonical_Longitude", "Source_Lat", "Source_Long",
-    "Source_Coordinate_Difference_Meters", "geometry",
+
+def _runtime_field(
+    field_name: str,
+    logical_type: str,
+    nullable: bool,
+    source_or_derivation: str,
+    description: str,
+    analyzer_use: str,
+    example: str = "",
+) -> dict[str, Any]:
+    return {
+        "field_name": field_name,
+        "logical_type": logical_type,
+        "nullable": nullable,
+        "source_or_derivation": source_or_derivation,
+        "description": description,
+        "analyzer_use": analyzer_use,
+        "example": example,
+    }
+
+
+RUNTIME_SCHEMA: tuple[dict[str, Any], ...] = (
+    _runtime_field("Source_System", "string", False, "constant", "Authoritative source system.", "provenance", SOURCE_SYSTEM),
+    _runtime_field("Source_Version", "string", False, "source archive timestamp", "Source release or as-of date.", "provenance", "2026-07-27"),
+    _runtime_field("Source_County", "string", False, "County", "Raw county value from the source.", "county audit", "Waukesha County"),
+    _runtime_field("Canonical_County", "string", False, "normalized County", "Canonical Wisconsin county name.", "county selection", "Waukesha"),
+    _runtime_field("Canonical_Native_Source_ID", "string", False, "NGUID or FID fallback", "Best stable native identifier.", "record identity"),
+    _runtime_field("Source_Record_ID", "string", False, "county + native ID/FID", "Globally unique pipeline record identifier.", "deduplication-safe identity"),
+    _runtime_field("NGUID", "string", True, "NGUID", "Original NG911 globally unique identifier.", "audit"),
+    _runtime_field("Source_Classification_Value", "string", True, "Place_Type/Placement/Structure/Exception", "Compact source classification trace.", "filter audit"),
+    _runtime_field("Canonical_HouseNoPrefix", "string", True, "AddNum_Pre", "House-number prefix, including Wisconsin grid prefixes.", "address construction", "W399S"),
+    _runtime_field("Canonical_HouseNo", "string", True, "AddNum_Pre + Add_Number", "Analyzer-compatible primary house number.", "current Analyzer", "W399S10950"),
+    _runtime_field("Canonical_HouseSx", "string", True, "AddNum_Suf", "House-number suffix.", "address construction", "A"),
+    _runtime_field("Canonical_Full_House_Number", "string", True, "derived", "Complete house number including prefix and suffix.", "preferred address construction", "W399S10950"),
+    _runtime_field("Canonical_Street_PreModifier", "string", True, "St_PreMod", "Street pre-modifier.", "full street"),
+    _runtime_field("Canonical_Dir", "string", True, "St_PreDir", "Street prefix direction.", "current Analyzer", "N"),
+    _runtime_field("Canonical_Street_PreType", "string", True, "St_PreTyp", "Street pre-type such as County Highway.", "full street", "County Highway"),
+    _runtime_field("Canonical_Street", "string", True, "St_Name", "Primary street name.", "current Analyzer", "Main"),
+    _runtime_field("Canonical_StType", "string", True, "St_PosTyp", "Street type.", "current Analyzer", "ST"),
+    _runtime_field("Canonical_SuffixDir", "string", True, "St_PosDir", "Street suffix direction.", "current Analyzer", "E"),
+    _runtime_field("Canonical_Street_PostModifier", "string", True, "St_PosMod", "Street post-modifier.", "full street"),
+    _runtime_field("Canonical_Full_Street", "string", True, "FullStNm or assembled components", "Complete physical street name without lost modifiers.", "preferred address construction"),
+    _runtime_field("Canonical_Abbreviated_Street", "string", True, "abFullStNm or full street", "Source-provided abbreviated street when available.", "mail export"),
+    _runtime_field("Canonical_Full_Address", "string", True, "derived physical address", "Base physical address without subaddress.", "current Analyzer"),
+    _runtime_field("Canonical_Mailable_Address", "string", True, "derived", "Mailing address including subaddress and postal line.", "Excel/NWS export"),
+    _runtime_field("Canonical_UnitType", "string", True, "Unit_PreType", "Unit or subaddress type.", "unit handling", "APT"),
+    _runtime_field("Canonical_Unit", "string", True, "Unit_Value", "Unit identifier.", "current Analyzer", "12"),
+    _runtime_field("Canonical_Building", "string", True, "Building", "Building identifier.", "subaddress audit"),
+    _runtime_field("Canonical_Floor", "string", True, "Floor", "Floor identifier.", "subaddress audit"),
+    _runtime_field("Canonical_Room", "string", True, "Room", "Room identifier.", "subaddress audit"),
+    _runtime_field("Canonical_Subaddress", "string", True, "derived", "Complete building/floor/unit/room representation.", "preferred unit handling"),
+    _runtime_field("Canonical_Muni", "string", True, "postal/locality hierarchy", "Best operational municipality or locality.", "current Analyzer"),
+    _runtime_field("Canonical_Postal_City", "string", True, "Post_Comm", "Postal city, kept distinct from municipality.", "mail export"),
+    _runtime_field("Canonical_State", "string", False, "State or WI fallback", "Two-letter state abbreviation.", "mail export", "WI"),
+    _runtime_field("Canonical_Zip_Code", "string", True, "Post_Code", "Normalized five-digit ZIP.", "current Analyzer", "53186"),
+    _runtime_field("Canonical_ZIP4", "string", True, "Post_Code4", "Normalized ZIP+4 extension.", "mail export", "1234"),
+    _runtime_field("Canonical_Full_ZIP", "string", True, "derived", "ZIP or ZIP+4.", "mail export", "53186-1234"),
+    _runtime_field("Canonical_Postal_City_Fallback_Flag", "boolean", False, "derived", "True when municipality/locality substituted for postal city.", "quality audit"),
+    _runtime_field("Canonical_Postal_Quality_Status", "string", False, "derived", "Complete, Partial, or Missing postal quality.", "quality audit"),
+    _runtime_field("Canonical_Status", "string", False, "canonical record role", "Analyzer-compatible status label.", "current Analyzer"),
+    _runtime_field("Canonical_Record_Role", "string", False, "derived", "Operational role such as Standalone Address or Building Parent.", "filtering"),
+    _runtime_field("Canonical_Occupancy_Category", "string", False, "derived", "Conservative residential/commercial/unknown occupancy class.", "apartment handling"),
+    _runtime_field("Canonical_Occupancy_Confidence", "string", False, "derived", "Confidence in occupancy classification.", "manual review"),
+    _runtime_field("Canonical_Occupancy_Reason", "string", False, "derived rule code", "Machine-readable evidence for occupancy classification.", "audit"),
+    _runtime_field("Potential_Parent_Record", "boolean", False, "derived address grouping", "Possible parent-building row.", "double-count prevention"),
+    _runtime_field("Potential_Child_Record", "boolean", False, "derived address grouping", "Possible child-unit row.", "double-count prevention"),
+    _runtime_field("Parent_Group_Key", "string", True, "normalized building address", "Deterministic inferred grouping key.", "parent-child audit"),
+    _runtime_field("Child_Record_Count", "integer", False, "derived", "Number of subaddress rows sharing the building key.", "parent-child audit"),
+    _runtime_field("Potential_Parent_Count", "integer", False, "derived", "Number of possible blank-subaddress parents for the group.", "ambiguity audit"),
+    _runtime_field("Potential_Double_Count_Flag", "boolean", False, "derived", "Parent record may overlap child units.", "double-count prevention"),
+    _runtime_field("Canonical_Analyzer_Eligible", "boolean", False, "derived", "Whether the record can participate in normal Analyzer processing.", "runtime filter"),
+    _runtime_field("Canonical_Analyzer_Handling", "string", False, "derived", "Machine-readable Analyzer action.", "runtime filter", "include_standard"),
+    _runtime_field("Canonical_Exclusion_Category", "string", False, "derived", "Default exclusion or review category.", "advanced exclusions", "none"),
+    _runtime_field("Canonical_Address_Quality_Status", "string", False, "derived", "Usable or Review address status.", "quality audit"),
+    _runtime_field("Canonical_Geometry_Quality_Status", "string", False, "derived", "Usable or Quarantine geometry status.", "spatial validation"),
+    _runtime_field("Canonical_Classification_Quality_Status", "string", False, "derived", "Usable or Review classification status.", "quality audit"),
+    _runtime_field("Canonical_Quality_Flags", "string", True, "derived", "Pipe-delimited non-destructive QA flags.", "Excluded Audit"),
+    _runtime_field("Canonical_Critical_Failure_Flag", "boolean", False, "derived", "True only for critical technical failures.", "quarantine reconciliation"),
+    _runtime_field("Quarantine_Reasons", "string", True, "derived", "Critical technical failure reasons; blank in runtime.", "reconciliation"),
+    _runtime_field("Canonical_Latitude", "float", False, "geometry", "Latitude in EPSG:4326.", "NWS export"),
+    _runtime_field("Canonical_Longitude", "float", False, "geometry", "Longitude in EPSG:4326.", "NWS export"),
+    _runtime_field("geometry", "geometry", False, "source geometry", "Point geometry in EPSG:4326.", "spatial assignment"),
+)
+
+RUNTIME_COLUMNS: tuple[str, ...] = tuple(item["field_name"] for item in RUNTIME_SCHEMA)
+RUNTIME_SCHEMA_BY_FIELD: dict[str, dict[str, Any]] = {item["field_name"]: item for item in RUNTIME_SCHEMA}
+
+RUNTIME_DTYPES: dict[str, str] = {
+    **{name: "string" for name in RUNTIME_COLUMNS if name != "geometry"},
+    "Canonical_Postal_City_Fallback_Flag": "boolean",
+    "Potential_Parent_Record": "boolean",
+    "Potential_Child_Record": "boolean",
+    "Potential_Double_Count_Flag": "boolean",
+    "Canonical_Analyzer_Eligible": "boolean",
+    "Canonical_Critical_Failure_Flag": "boolean",
+    "Child_Record_Count": "Int64",
+    "Potential_Parent_Count": "Int64",
+    "Canonical_Latitude": "float64",
+    "Canonical_Longitude": "float64",
+}
+
+STATUS_DEFINITIONS: tuple[dict[str, Any], ...] = (
+    {"value": "validated", "definition": "Technical and known coverage validation passed.", "default_analyzer_behavior": "available", "manual_review_recommended": False},
+    {"value": "validated_with_warnings", "definition": "Technical validation passed with non-critical warnings.", "default_analyzer_behavior": "available_with_warning", "manual_review_recommended": True},
+    {"value": "not_processed", "definition": "Current-run state: the county was not processed in this invocation. This does not replace durable coverage or production-source knowledge.", "default_analyzer_behavior": "unavailable", "manual_review_recommended": False},
+    {"value": "needs_validation", "definition": "Durable coverage state: technically represented, but county coverage has not been independently approved.", "default_analyzer_behavior": "not_public", "manual_review_recommended": True},
+    {"value": "failed_validation", "definition": "Current-run state: selected county failed processing or critical validation.", "default_analyzer_behavior": "unavailable", "manual_review_recommended": True},
+    {"value": "incomplete_coverage", "definition": "Durable coverage or production state: countywide coverage is known incomplete.", "default_analyzer_behavior": "unavailable", "manual_review_recommended": True},
+    {"value": "county_override", "definition": "Durable production-source state: use a separate county-specific source.", "default_analyzer_behavior": "use_override", "manual_review_recommended": False},
+    {"value": "unavailable", "definition": "No approved production source is available.", "default_analyzer_behavior": "unavailable", "manual_review_recommended": False},
+    {"value": "not_present_in_source", "definition": "County is absent from the statewide source snapshot.", "default_analyzer_behavior": "unavailable", "manual_review_recommended": False},
+)
+
+CLASSIFICATION_DEFINITIONS: tuple[dict[str, Any], ...] = (
+    {"value": "Standalone Address", "definition": "Address without a populated subaddress or stronger specialized source role.", "default_analyzer_behavior": "include_standard", "confidence_meaning": "Medium unless stronger source evidence exists.", "manual_review_recommended": False},
+    {"value": "Residential Unit", "definition": "Priority 1: explicit residential apartment, condominium, duplex-side, or supported residential unit evidence.", "default_analyzer_behavior": "include_unit", "confidence_meaning": "Usually High.", "manual_review_recommended": False},
+    {"value": "Commercial Unit", "definition": "Priority 1: explicit suite or office unit evidence.", "default_analyzer_behavior": "include_unit", "confidence_meaning": "Usually High.", "manual_review_recommended": False},
+    {"value": "Parcel or Site", "definition": "Priority 2: explicit parcel or site source evidence, including records that also contain a generic subaddress.", "default_analyzer_behavior": "exclude_default", "confidence_meaning": "Medium.", "manual_review_recommended": True},
+    {"value": "Utility or Infrastructure", "definition": "Priority 2: explicit utility or infrastructure source evidence, including records that also contain a generic subaddress.", "default_analyzer_behavior": "exclude_default", "confidence_meaning": "Medium.", "manual_review_recommended": True},
+    {"value": "Other Non-Mailable Site", "definition": "Priority 2: access, entrance, gate, driveway, or other explicit non-mailing source evidence.", "default_analyzer_behavior": "exclude_default", "confidence_meaning": "Medium.", "manual_review_recommended": True},
+    {"value": "Unknown Unit Address", "definition": "Priority 3: a subaddress exists without explicit residential, commercial, parcel, utility, access, infrastructure, or other non-mailable evidence.", "default_analyzer_behavior": "manual_review", "confidence_meaning": "Low by design.", "manual_review_recommended": True},
+    {"value": "Building Parent", "definition": "Blank-subaddress row sharing a building key with child-unit rows; parent-child logic is applied after source-role classification.", "default_analyzer_behavior": "include_parent_for_review", "confidence_meaning": "Medium or High depending on child count.", "manual_review_recommended": True},
+)
+
+REPORT_SCHEMAS: dict[str, tuple[str, ...]] = {
+    "county_summary.csv": (
+        "county", "county_key", "statewide_inventory_count", "processed_source_count",
+        "runtime_count", "quarantine_count", "reconciliation_passed",
+        "runtime_column_count", "full_fidelity_column_count",
+        "runtime_file_size_bytes", "full_fidelity_file_size_bytes",
+        "runtime_size_reduction_bytes", "runtime_size_reduction_pct",
+        "geometry_completeness", "nguid_completeness", "missing_nguid_count",
+        "duplicate_nguid_record_count", "duplicate_source_record_id_count",
+        "street_completeness", "postal_city_completeness", "zip_completeness",
+        "municipality_locality_completeness", "parent_count", "child_count",
+        "unknown_unit_count", "warning_count", "technical_warning_count",
+        "classification_conflict_count", "subaddress_with_parcel_or_site_count",
+        "subaddress_with_utility_or_infrastructure_count",
+        "subaddress_with_access_or_non_mailable_count", "row_group_count", "covering_bbox_written", "bbox_read_validated",
+        "validation_status", "coverage_readiness_status", "production_source_status",
+        "readiness_reason", "elapsed_processing_seconds",
+        "latest_plausible_source_update_date", "full_fidelity_sha256",
+        "runtime_sha256", "quarantine_sha256", "validation_messages",
+    ),
+    "county_name_variants.csv": (
+        "canonical_county", "raw_variants", "statewide_inventory_count", "represented",
+        "initial_coverage_status", "status_reason",
+    ),
+    "field_completeness.csv": ("county", "field", "record_count", "null_count", "blank_or_null_count", "completeness_pct"),
+    "classification_values.csv": ("county", "source_field", "value", "count", "pct"),
+    "record_role_summary.csv": ("county", "record_role", "count", "pct"),
+    "occupancy_summary.csv": ("county", "occupancy_category", "occupancy_confidence", "occupancy_reason", "count", "pct"),
+    "parent_child_summary.csv": (
+        "county", "potential_parent_records", "potential_child_records",
+        "source_parent_candidates", "parent_records_zero_matching_children",
+        "parent_records_one_matching_child", "parent_records_multiple_matching_children",
+        "children_one_possible_parent", "children_multiple_possible_parents",
+        "potential_double_count_records", "conflicting_parent_child_records",
+        "parent_groups",
+    ),
+    "date_anomalies.csv": ("county", "Source_Record_ID", "NGUID", "DateUpdate_Raw", "Effective_Raw", "Expire_Raw", "Canonical_Date_Quality_Flags"),
+    "coordinate_anomalies.csv": ("county", "Source_Record_ID", "NGUID", "Source_Lat", "Source_Long", "Canonical_Latitude", "Canonical_Longitude", "Source_Coordinate_Difference_Meters", "anomaly_reason"),
+    "duplicate_address_summary.csv": ("county", "normalized_address_key", "record_count"),
+    "duplicate_nguid_report.csv": ("canonical_county", "source_county", "NGUID", "duplicate_record_count", "source_fids"),
+    "postal_fallback_summary.csv": ("county", "locality_source", "count", "pct"),
+    "quarantine_summary.csv": ("county", "quarantine_reason", "count"),
+    "classification_conflicts.csv": (
+        "county", "source_record_id", "nguid", "source_place_type",
+        "source_placement", "source_structure", "source_exception",
+        "unit_type", "unit_value", "subaddress", "selected_record_role",
+        "classification_reason", "analyzer_handling", "exclusion_category",
+        "conflict_type",
+    ),
+    "output_files.csv": (
+        "county", "output_type", "relative_path", "file_size_bytes", "sha256",
+        "row_count", "column_count", "crs", "created_timestamp_utc",
+        "schema_version", "classification_rule_version", "row_group_count",
+    ),
+    "previous_release_warnings.csv": ("county", "field", "previous", "current", "change_pct", "warning"),
+    "failures.csv": ("county", "processing_stage", "exception_type", "exception_message", "timestamp_utc", "traceback_reference"),
+}
+
+MANIFEST_COLUMNS: tuple[str, ...] = (
+    "canonical_county", "county_key", "source_system", "source_version", "source_hash",
+    "statewide_inventory_count", "processed_source_count", "runtime_count",
+    "quarantine_count", "requested_in_run", "processed_in_run", "skipped_by_resume",
+    "technical_validation_status", "coverage_readiness_status",
+    "production_source_status", "public_availability_status", "status_reason",
+    "run_processing_status", "run_processing_reason", "recommended_source",
+    "spatial_readiness", "address_readiness",
+    "postal_readiness", "occupancy_classification_readiness", "validation_date",
+    "runtime_relative_path", "runtime_byte_size", "runtime_sha256",
+    "full_fidelity_relative_path", "full_fidelity_byte_size", "full_fidelity_sha256",
+    "quarantine_relative_path", "quarantine_byte_size", "quarantine_sha256",
+    "latest_plausible_source_update_date", "quality_score_summary",
+    "classification_conflict_count", "subaddress_with_parcel_or_site_count",
+    "subaddress_with_utility_or_infrastructure_count",
+    "subaddress_with_access_or_non_mailable_count",
+    "covering_bbox_written", "bbox_read_validated", "validation_passed",
+    "pipeline_version", "runtime_schema_version", "full_fidelity_schema_version",
+    "manifest_schema_version", "classification_rule_version",
 )
 
 
@@ -258,6 +414,9 @@ class PipelineConfig:
     as_of_date_source: str
     counties: tuple[str, ...] | None
     overwrite: bool
+    resume: bool
+    validate_only: bool
+    schema_report: bool
     runtime_only: bool
     full_fidelity_only: bool
     keep_extracted_gdb: bool
@@ -302,6 +461,7 @@ class ReportStore:
     duplicate_nguid_report: list[dict[str, Any]] = field(default_factory=list)
     postal_fallback_summary: list[dict[str, Any]] = field(default_factory=list)
     quarantine_summary: list[dict[str, Any]] = field(default_factory=list)
+    classification_conflicts: list[dict[str, Any]] = field(default_factory=list)
     output_files: list[dict[str, Any]] = field(default_factory=list)
     failures: list[dict[str, Any]] = field(default_factory=list)
 
@@ -326,6 +486,7 @@ class CountyOutput:
     validation_passed: bool
     validation_messages: list[str]
     metrics: dict[str, Any]
+    skipped_by_resume: bool = False
 
 
 class PipelineError(RuntimeError):
@@ -386,24 +547,48 @@ def atomic_write_json(path: Path, payload: Any) -> None:
     os.replace(temporary, path)
 
 
-def atomic_write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+def atomic_write_csv(
+    path: Path,
+    rows: Sequence[Mapping[str, Any]],
+    fieldnames: Sequence[str] | None = None,
+) -> None:
+    """Write a stable-schema CSV atomically, including headers when empty."""
     ensure_directory(path.parent)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    if rows:
-        fieldnames: list[str] = []
+    if fieldnames is None:
+        discovered: list[str] = []
         seen: set[str] = set()
         for row in rows:
             for key in row:
                 if key not in seen:
                     seen.add(key)
-                    fieldnames.append(key)
-        with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
-    else:
-        temporary.write_text("", encoding="utf-8")
+                    discovered.append(key)
+        fieldnames = discovered
+    with temporary.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=list(fieldnames),
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name) for name in fieldnames})
     os.replace(temporary, path)
+
+
+def portable_relative_path(path: Path, output_root: Path) -> str:
+    """Return a validated POSIX path relative to the pipeline output root."""
+    try:
+        relative = path.resolve().relative_to(output_root.resolve()).as_posix()
+    except ValueError as exc:
+        raise ValidationError(f"Output path is outside the pipeline root: {path}") from exc
+    forbidden = ("/workspaces/", "\\workspaces\\", "/tmp/", "\\temp\\")
+    lowered = relative.lower()
+    if Path(relative).is_absolute() or re.match(r"^[A-Za-z]:", relative):
+        raise ValidationError(f"Portable output path is absolute: {relative}")
+    if any(token in lowered for token in forbidden):
+        raise ValidationError(f"Portable output path contains an environment-specific segment: {relative}")
+    return relative
 
 
 def normalize_whitespace(value: Any) -> str:
@@ -619,7 +804,19 @@ def inspect_source(
 
 def write_source_metadata(output_dir: Path, metadata: SourceMetadata) -> None:
     metadata_dir = ensure_directory(output_dir / "source_metadata")
-    atomic_write_json(metadata_dir / "source_inventory.json", asdict(metadata))
+    inventory_payload = asdict(metadata)
+    inventory_payload["input_filename"] = Path(metadata.input_path).name
+    inventory_payload["input_path_diagnostic"] = inventory_payload.pop("input_path")
+    inventory_payload["gdb_path_diagnostic"] = inventory_payload.pop("gdb_path")
+    inventory_payload.update({
+        "pipeline_version": PIPELINE_VERSION,
+        "runtime_schema_version": RUNTIME_SCHEMA_VERSION,
+        "full_fidelity_schema_version": FULL_FIDELITY_SCHEMA_VERSION,
+        "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
+        "classification_rule_version": CLASSIFICATION_RULE_VERSION,
+        "portable_path_note": "Absolute source paths are diagnostic only and are not used in portable manifests.",
+    })
+    atomic_write_json(metadata_dir / "source_inventory.json", inventory_payload)
     field_rows = []
     dtype_lookup = dict(zip(metadata.source_fields, metadata.source_dtypes))
     for ordinal, field_name in enumerate(metadata.source_fields, start=1):
@@ -630,18 +827,101 @@ def write_source_metadata(output_dir: Path, metadata: SourceMetadata) -> None:
             "required": field_name in REQUIRED_SOURCE_FIELDS,
             "optional_known": field_name in OPTIONAL_SOURCE_FIELDS,
         })
-    atomic_write_csv(metadata_dir / "source_fields.csv", field_rows)
+    atomic_write_csv(
+        metadata_dir / "source_fields.csv",
+        field_rows,
+        ("ordinal", "field", "dtype", "required", "optional_known"),
+    )
+
+
+def write_schema_documentation(
+    output_dir: Path,
+    metadata: SourceMetadata,
+    full_fidelity_columns: Sequence[str] | None = None,
+) -> None:
+    metadata_dir = ensure_directory(output_dir / "source_metadata")
+    atomic_write_csv(
+        metadata_dir / "runtime_schema.csv",
+        list(RUNTIME_SCHEMA),
+        ("field_name", "logical_type", "nullable", "source_or_derivation", "description", "analyzer_use", "example"),
+    )
+    full_columns = list(full_fidelity_columns or ["Source_FID", *metadata.source_fields, *RUNTIME_COLUMNS])
+    seen: set[str] = set()
+    full_rows: list[dict[str, Any]] = []
+    source_dtype_lookup = dict(zip(metadata.source_fields, metadata.source_dtypes))
+    for field_name in full_columns:
+        if field_name in seen:
+            continue
+        seen.add(field_name)
+        runtime_definition = RUNTIME_SCHEMA_BY_FIELD.get(field_name)
+        if field_name in metadata.source_fields:
+            source_or_derivation = "original source field"
+            description = "Original Wisconsin NG911 source attribute retained without destructive normalization."
+            logical_type = source_dtype_lookup.get(field_name, "source-defined")
+        elif field_name == "geometry":
+            source_or_derivation = "original source geometry"
+            description = "Original point geometry normalized to EPSG:4326."
+            logical_type = "geometry"
+        elif runtime_definition:
+            source_or_derivation = runtime_definition["source_or_derivation"]
+            description = runtime_definition["description"]
+            logical_type = runtime_definition["logical_type"]
+        else:
+            source_or_derivation = "pipeline-derived"
+            description = "Derived preservation or QA field; see the pipeline implementation for the exact rule."
+            logical_type = "derived"
+        full_rows.append({
+            "field_name": field_name,
+            "logical_type": logical_type,
+            "nullable": True,
+            "source_or_derivation": source_or_derivation,
+            "description": description,
+            "retention_policy": "Preserved in full fidelity",
+        })
+    atomic_write_csv(
+        metadata_dir / "full_fidelity_schema.csv",
+        full_rows,
+        ("field_name", "logical_type", "nullable", "source_or_derivation", "description", "retention_policy"),
+    )
+    status_rows = [
+        {**row, "manifest_schema_version": MANIFEST_SCHEMA_VERSION}
+        for row in STATUS_DEFINITIONS
+    ]
+    classification_rows = [
+        {**row, "classification_rule_version": CLASSIFICATION_RULE_VERSION}
+        for row in CLASSIFICATION_DEFINITIONS
+    ]
+    atomic_write_csv(
+        metadata_dir / "status_definitions.csv",
+        status_rows,
+        (
+            "value", "definition", "default_analyzer_behavior",
+            "manual_review_recommended", "manifest_schema_version",
+        ),
+    )
+    atomic_write_csv(
+        metadata_dir / "classification_definitions.csv",
+        classification_rows,
+        (
+            "value", "definition", "default_analyzer_behavior",
+            "confidence_meaning", "manual_review_recommended",
+            "classification_rule_version",
+        ),
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Standardize Wisconsin statewide NG911 address points into county GeoParquet files."
+        description="Standardize Wisconsin statewide NG911 address points into production county GeoParquet files."
     )
     parser.add_argument("--input", required=True, type=Path, help="Source ZIP or extracted .gdb")
     parser.add_argument("--output", required=True, type=Path, help="Pipeline output directory")
     parser.add_argument("--as-of-date", help="Eligibility reference date in YYYY-MM-DD")
-    parser.add_argument("--counties", nargs="+", help="Canonical county names to process")
-    parser.add_argument("--overwrite", action="store_true", help="Replace existing county outputs")
+    parser.add_argument("--counties", nargs="+", help="Canonical county names; names may include the word County")
+    parser.add_argument("--overwrite", action="store_true", help="Replace selected county outputs after new files validate")
+    parser.add_argument("--resume", action="store_true", help="Validate and skip complete county outputs; rebuild missing or invalid outputs")
+    parser.add_argument("--validate-only", action="store_true", help="Validate existing selected outputs without rebuilding county files")
+    parser.add_argument("--schema-report", action="store_true", help="Write schema/status documentation and exit before county processing")
     parser.add_argument("--runtime-only", action="store_true", help="Skip full-fidelity county files")
     parser.add_argument("--full-fidelity-only", action="store_true", help="Skip runtime county files")
     parser.add_argument("--keep-extracted-gdb", action="store_true", help="Retain extracted GDB under output/source_metadata/extracted")
@@ -652,6 +932,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.runtime_only and args.full_fidelity_only:
         parser.error("--runtime-only and --full-fidelity-only are mutually exclusive")
+    if args.resume and args.overwrite:
+        parser.error("--resume and --overwrite are mutually exclusive; resume safely replaces only invalid outputs")
+    if args.validate_only and args.overwrite:
+        parser.error("--validate-only cannot be combined with --overwrite")
     if args.row_group_size < 1_000:
         parser.error("--row-group-size must be at least 1000")
     return args
@@ -674,17 +958,22 @@ def read_inventory(
     gdb_path: Path,
     source_feature_count: int,
     reports: ReportStore,
-) -> tuple["pd.DataFrame", dict[str, tuple[str, ...]], set[str]]:
-    """Read only County and NGUID for statewide inventory and identity QA."""
+) -> tuple["pd.DataFrame", dict[str, tuple[str, ...]], dict[str, int], set[str]]:
+    """Read County and NGUID once for statewide inventory and identity QA."""
     LOGGER.info("Reading statewide County and NGUID inventory (%s records)", f"{source_feature_count:,}")
     inventory = pyogrio.read_dataframe(
         gdb_path,
         layer=LAYER_NAME,
         columns=["County", "NGUID"],
         read_geometry=False,
+        fid_as_index=True,
         datetime_as_string=True,
         use_arrow=True,
     )
+    inventory = inventory.reset_index()
+    fid_column = inventory.columns[0]
+    if fid_column != "Source_FID":
+        inventory = inventory.rename(columns={fid_column: "Source_FID"})
     if len(inventory) != source_feature_count:
         raise ValidationError(
             f"Inventory row count {len(inventory):,} does not match source feature count {source_feature_count:,}"
@@ -694,35 +983,52 @@ def read_inventory(
     unknown_values = sorted(inventory.loc[inventory["Canonical_County"].isna(), "Source_County"].unique())
     if unknown_values:
         raise ValidationError("Unrecognized county values: " + ", ".join(repr(v) for v in unknown_values))
+
     variants: dict[str, tuple[str, ...]] = {}
+    inventory_counts: dict[str, int] = {}
     for county in WI_COUNTIES:
-        values = tuple(sorted(inventory.loc[inventory["Canonical_County"].eq(county), "Source_County"].unique()))
+        county_mask = inventory["Canonical_County"].eq(county)
+        values = tuple(sorted(inventory.loc[county_mask, "Source_County"].unique()))
+        count = int(county_mask.sum())
         variants[county] = values
-        count = int(inventory["Canonical_County"].eq(county).sum())
-        status, reason = STATUS_OVERRIDES.get(
-            county,
-            (("needs_validation", "Represented in source but not independently validated") if count else ("unavailable", "County is absent from the statewide source snapshot")),
-        )
+        inventory_counts[county] = count
+        override = COUNTY_STATUS_OVERRIDES.get(county)
+        if count == 0:
+            initial_status = "not_present_in_source"
+            reason = "County is absent from the statewide source snapshot."
+        elif override:
+            initial_status = str(override["coverage_readiness_status"])
+            reason = str(override["reason"])
+        else:
+            initial_status = "needs_validation"
+            reason = "Represented in source but not independently approved for production."
         reports.county_name_variants.append({
             "canonical_county": county,
             "raw_variants": " | ".join(values),
-            "source_record_count": count,
+            "statewide_inventory_count": count,
             "represented": bool(count),
-            "initial_status": status,
+            "initial_coverage_status": initial_status,
             "status_reason": reason,
         })
+
     nguid = clean_series(inventory, "NGUID")
-    missing_mask = nguid.eq("")
-    if missing_mask.any():
-        LOGGER.error("Statewide inventory contains %s missing NGUID values", f"{int(missing_mask.sum()):,}")
+    missing_count = int(nguid.eq("").sum())
+    if missing_count:
+        LOGGER.warning("Statewide inventory contains %s missing NGUID values; FID fallbacks will preserve them", f"{missing_count:,}")
     duplicate_mask = nguid.ne("") & nguid.duplicated(keep=False)
     duplicate_values = set(nguid[duplicate_mask].tolist())
     if duplicate_values:
-        duplicate_rows = inventory.loc[duplicate_mask, ["County", "NGUID"]].copy()
-        for row in duplicate_rows.itertuples(index=False):
-            reports.duplicate_nguid_report.append({"County": row.County, "NGUID": row.NGUID})
-        LOGGER.error("Statewide inventory contains %s duplicated NGUID values", f"{len(duplicate_values):,}")
-    return inventory, variants, duplicate_values
+        duplicate_rows = inventory.loc[duplicate_mask, ["Source_FID", "Source_County", "Canonical_County", "NGUID"]].copy()
+        for nguid_value, group in duplicate_rows.groupby("NGUID", sort=True):
+            reports.duplicate_nguid_report.append({
+                "canonical_county": " | ".join(sorted(group["Canonical_County"].dropna().astype(str).unique())),
+                "source_county": " | ".join(sorted(group["Source_County"].dropna().astype(str).unique())),
+                "NGUID": nguid_value,
+                "duplicate_record_count": len(group),
+                "source_fids": " | ".join(str(value) for value in group["Source_FID"].tolist()),
+            })
+        LOGGER.warning("Statewide inventory contains %s duplicated NGUID value(s); all records will be preserved with unique Source_Record_ID values", f"{len(duplicate_values):,}")
+    return inventory, variants, inventory_counts, duplicate_values
 
 
 class WisconsinStatewideNG911Adapter:
@@ -765,7 +1071,9 @@ class WisconsinStatewideNG911Adapter:
             frame.insert(0, "Source_FID", pd.Series(range(len(frame)), dtype="int64"))
         if frame.crs is None:
             frame = frame.set_crs(self.metadata.crs)
-        if str(frame.crs).upper() != "EPSG:4326":
+        if frame.crs is None:
+            raise ValidationError("County source has no CRS.")
+        if frame.crs.to_epsg() != 4326:
             frame = frame.to_crs("EPSG:4326")
         return frame
 
@@ -783,9 +1091,26 @@ class WisconsinStatewideNG911Adapter:
         frame["Source_Version"] = self.source_version
         frame["Source_County"] = clean_series(frame, "County")
         frame["Source_State"] = clean_series(frame, "State").replace("", SOURCE_STATE)
+        frame["Canonical_State"] = frame["Source_State"].str.upper().replace("", SOURCE_STATE)
         frame["Canonical_County"] = county
-        frame["Canonical_Native_Source_ID"] = clean_series(frame, "NGUID")
-        frame["Source_Record_ID"] = county_prefix(county) + "-" + frame["Canonical_Native_Source_ID"]
+
+        nguid = clean_series(frame, "NGUID")
+        source_fid = clean_series(frame, "Source_FID")
+        fallback_sequence = pd.Series(frame.index.astype(str), index=frame.index, dtype="string")
+        source_fid_stable = source_fid.where(source_fid.ne(""), fallback_sequence)
+        fallback_native_id = "FID-" + source_fid_stable
+        native_id = nguid.where(nguid.ne(""), fallback_native_id)
+        frame["Canonical_Native_Source_ID"] = native_id
+        base_record_id = county_prefix(county) + "-" + native_id
+        duplicate_base = base_record_id.duplicated(keep=False)
+        record_id = base_record_id.where(
+            ~duplicate_base,
+            base_record_id + "-FID-" + source_fid_stable,
+        )
+        if record_id.duplicated(keep=False).any():
+            duplicate_sequence = record_id.groupby(record_id).cumcount().astype("string")
+            record_id = record_id.where(~record_id.duplicated(keep=False), record_id + "-SEQ-" + duplicate_sequence)
+        frame["Source_Record_ID"] = record_id.astype("string")
 
         geometry = frame.geometry
         geometry_present = geometry.notna() & ~geometry.is_empty
@@ -796,25 +1121,23 @@ class WisconsinStatewideNG911Adapter:
             x_values.loc[point_mask] = geometry.loc[point_mask].x
             y_values.loc[point_mask] = geometry.loc[point_mask].y
         finite_mask = point_mask & np.isfinite(x_values) & np.isfinite(y_values)
+        global_range_mask = finite_mask & x_values.between(-180, 180) & y_values.between(-90, 90)
         minx, miny, maxx, maxy = self.config.wisconsin_bounds
-        envelope_mask = finite_mask & x_values.between(minx, maxx) & y_values.between(miny, maxy)
+        envelope_mask = global_range_mask & x_values.between(minx, maxx) & y_values.between(miny, maxy)
         frame["Canonical_Longitude"] = x_values
         frame["Canonical_Latitude"] = y_values
         frame["Source_Lat"] = frame["Lat"] if "Lat" in frame.columns else pd.NA
         frame["Source_Long"] = frame["Long"] if "Long" in frame.columns else pd.NA
 
-        nguid = clean_series(frame, "NGUID")
-        missing_nguid = nguid.eq("")
-        duplicate_nguid = nguid.isin(self.duplicate_nguids)
         quarantine_reasons = pd.Series("", index=frame.index, dtype="string")
         quarantine_reasons = append_flag_series(quarantine_reasons, ~geometry_present, "Missing Geometry")
         quarantine_reasons = append_flag_series(quarantine_reasons, geometry_present & ~point_mask, "Non-Point Geometry")
         quarantine_reasons = append_flag_series(quarantine_reasons, point_mask & ~finite_mask, "Nonfinite Geometry")
-        quarantine_reasons = append_flag_series(quarantine_reasons, finite_mask & ~envelope_mask, "Geometry Outside Wisconsin Envelope")
-        quarantine_reasons = append_flag_series(quarantine_reasons, missing_nguid, "Missing NGUID")
-        quarantine_reasons = append_flag_series(quarantine_reasons, duplicate_nguid, "Duplicate NGUID")
+        quarantine_reasons = append_flag_series(quarantine_reasons, finite_mask & ~global_range_mask, "Geometry Outside Global Coordinate Range")
+        quarantine_reasons = append_flag_series(quarantine_reasons, global_range_mask & ~envelope_mask, "Geometry Outside Wisconsin Envelope")
         frame["Quarantine_Reasons"] = quarantine_reasons
-        quarantine_mask = quarantine_reasons.ne("")
+        frame["Canonical_Critical_Failure_Flag"] = quarantine_reasons.ne("")
+        quarantine_mask = frame["Canonical_Critical_Failure_Flag"]
 
         self._derive_house(frame)
         self._derive_street(frame)
@@ -830,11 +1153,7 @@ class WisconsinStatewideNG911Adapter:
         full_fidelity = gpd.GeoDataFrame(frame, geometry="geometry", crs="EPSG:4326")
         runtime = full_fidelity.loc[~quarantine_mask].copy()
         quarantine = full_fidelity.loc[quarantine_mask].copy()
-
-        missing_runtime_columns = [column for column in RUNTIME_COLUMNS if column not in runtime.columns]
-        for column in missing_runtime_columns:
-            runtime[column] = pd.NA
-        runtime = gpd.GeoDataFrame(runtime.loc[:, list(RUNTIME_COLUMNS)], geometry="geometry", crs="EPSG:4326")
+        runtime = coerce_runtime_schema(runtime)
 
         full_fidelity = spatially_order(full_fidelity)
         runtime = spatially_order(runtime)
@@ -994,6 +1313,7 @@ class WisconsinStatewideNG911Adapter:
     def _derive_dates(self, frame: "gpd.GeoDataFrame") -> None:
         parsed: dict[str, pd.Series] = {}
         flags = pd.Series("", index=frame.index, dtype="string")
+        as_of = pd.Timestamp(self.config.as_of_date, tz="UTC")
         for source in ("DateUpdate", "Effective", "Expire"):
             raw_column = f"{source}_Raw"
             parsed_column = f"{source}_Parsed"
@@ -1004,23 +1324,30 @@ class WisconsinStatewideNG911Adapter:
             frame[parsed_column] = parsed_values
             invalid = raw.ne("") & parsed_values.isna()
             flags = append_flag_series(flags, invalid, f"Invalid {source}")
+            future = parsed_values.notna() & parsed_values.gt(as_of + pd.Timedelta(days=1))
+            flags = append_flag_series(flags, future, f"Future {source}")
+            implausibly_old = parsed_values.notna() & parsed_values.lt(pd.Timestamp("1900-01-01", tz="UTC"))
+            flags = append_flag_series(flags, implausibly_old, f"Implausibly Old {source}")
             if source == "DateUpdate":
                 placeholder = parsed_values.dt.date.eq(date(1970, 1, 1))
                 flags = append_flag_series(flags, placeholder.fillna(False), "Placeholder DateUpdate 1970-01-01")
-        frame["Canonical_Date_Quality_Flags"] = flags
-        as_of = pd.Timestamp(self.config.as_of_date, tz="UTC")
         effective = parsed["Effective"]
         expire = parsed["Expire"]
-        future = effective.notna() & effective.gt(as_of)
+        inconsistent = effective.notna() & expire.notna() & expire.lt(effective)
+        flags = append_flag_series(flags, inconsistent, "Expire Before Effective")
+        frame["Canonical_Date_Quality_Flags"] = flags
+
+        future_effective = effective.notna() & effective.gt(as_of)
         expired = expire.notna() & expire.le(as_of)
         uncertain = (
             (clean_series(frame, "Effective").ne("") & effective.isna())
             | (clean_series(frame, "Expire").ne("") & expire.isna())
+            | inconsistent
         )
         active_status = pd.Series("Active", index=frame.index, dtype="string")
-        active_status = active_status.mask(future, "Future Effective")
+        active_status = active_status.mask(future_effective, "Future Effective")
         active_status = active_status.mask(expired, "Expired")
-        active_status = active_status.mask(uncertain & ~future & ~expired, "Date Uncertain")
+        active_status = active_status.mask(uncertain & ~future_effective & ~expired, "Date Uncertain")
         frame["Canonical_Active_Status"] = active_status
         frame["Canonical_Eligibility_Status"] = active_status.map({
             "Active": "Technically Usable",
@@ -1075,6 +1402,16 @@ class WisconsinStatewideNG911Adapter:
         frame["Parent_Group_Key"] = frame["Normalized_Building_Address_Key"]
 
     def _derive_classification(self, frame: "gpd.GeoDataFrame") -> None:
+        """Derive conservative occupancy and record roles with explicit precedence.
+
+        Priority 1: explicit residential or commercial unit evidence.
+        Priority 2: explicit parcel, utility, access, infrastructure, or other
+        non-mailable source evidence.
+        Priority 3: an otherwise-unclassified populated subaddress.
+
+        A populated subaddress never erases stronger non-mailable source
+        evidence. Conflicts are retained as QA flags and reports, not quarantined.
+        """
         landmark = clean_series(frame, "LandmkName")
         place_type = clean_series(frame, "Place_Type")
         placement = clean_series(frame, "Placement")
@@ -1085,110 +1422,380 @@ class WisconsinStatewideNG911Adapter:
         frame["Source_Placement"] = placement
         frame["Source_Structure"] = structure
         frame["Source_Exception"] = exception
-        combined = (
-            landmark + " | " + place_type + " | " + placement + " | " + structure
-            + " | " + frame["Canonical_UnitType"].astype("string").fillna("")
+        source_classification = pd.concat(
+            [place_type, placement, structure, exception], axis=1
+        ).fillna("").agg(" | ".join, axis=1).str.replace(
+            r"(?:\s*\|\s*)+$", "", regex=True
+        ).str.strip(" |")
+        frame["Source_Classification_Value"] = source_classification
+
+        source_evidence = (
+            landmark + " | " + place_type + " | " + placement + " | "
+            + structure + " | " + exception
         ).str.upper()
+        combined = (
+            source_evidence + " | "
+            + frame["Canonical_UnitType"].astype("string").fillna("").str.upper()
+        )
         has_subaddress = frame["Canonical_Subaddress"].astype("string").ne("")
-        unit_type = frame["Canonical_UnitType"].str.upper()
+        unit_type = frame["Canonical_UnitType"].astype("string").str.upper()
 
-        occupancy = pd.Series("Unknown", index=frame.index, dtype="string")
-        reasons = pd.Series("No confident occupancy rule matched", index=frame.index, dtype="string")
-        confidence = pd.Series("Low", index=frame.index, dtype="string")
+        occupancy = pd.Series(
+            "No Unit Classification", index=frame.index, dtype="string"
+        )
+        reason_code = pd.Series(
+            "no_subaddress", index=frame.index, dtype="string"
+        )
+        reason_text = pd.Series(
+            "No subaddress fields are populated", index=frame.index, dtype="string"
+        )
+        confidence = pd.Series(
+            "Not Applicable", index=frame.index, dtype="string"
+        )
+        occupancy = occupancy.mask(has_subaddress, "Unknown Unit or Subaddress")
+        reason_code = reason_code.mask(
+            has_subaddress, "subaddress_without_occupancy_or_site_evidence"
+        )
+        reason_text = reason_text.mask(
+            has_subaddress,
+            "Subaddress exists but the source does not establish occupancy or specialized-site type",
+        )
+        confidence = confidence.mask(has_subaddress, "Low")
 
-        apartment = unit_type.str.contains(r"\b(?:APT|APARTMENT|CONDO|CONDOMINIUM)\b", regex=True)
-        residential_side = unit_type.str.contains(r"\b(?:UPPER|LOWER|FRONT|REAR)\b", regex=True)
-        commercial = unit_type.str.contains(r"\b(?:SUITE|STE|OFFICE)\b", regex=True)
-        hotel = combined.str.contains(r"\b(?:HOTEL|MOTEL|INN|LODGE)\b", regex=True) & has_subaddress
-        dorm = combined.str.contains(r"\b(?:DORM|DORMITORY|RESIDENCE HALL)\b", regex=True) & has_subaddress
-        campground = combined.str.contains(r"\b(?:CAMPGROUND|CAMPSITE|CAMP SITE)\b", regex=True) & has_subaddress
-        mobile = combined.str.contains(r"\b(?:MOBILE HOME|TRAILER PARK|MANUFACTURED HOME)\b", regex=True) & has_subaddress
-        storage = combined.str.contains(r"\b(?:STORAGE|WAREHOUSE UNIT)\b", regex=True) & has_subaddress
+        apartment = unit_type.str.contains(
+            r"\b(?:APT|APARTMENT|CONDO|CONDOMINIUM)\b", regex=True
+        )
+        residential_side = unit_type.str.contains(
+            r"\b(?:UPPER|LOWER|FRONT|REAR)\b", regex=True
+        )
+        generic_unit = unit_type.str.fullmatch(r"\s*(?:UNIT|UNT)\s*", na=False)
+        commercial = unit_type.str.contains(
+            r"\b(?:SUITE|STE|OFFICE)\b", regex=True
+        )
+        hotel = (
+            combined.str.contains(r"\b(?:HOTEL|MOTEL|INN|LODGE)\b", regex=True)
+            & has_subaddress
+        )
+        dorm = (
+            combined.str.contains(
+                r"\b(?:DORM|DORMITORY|RESIDENCE HALL)\b", regex=True
+            )
+            & has_subaddress
+        )
+        campground = (
+            combined.str.contains(
+                r"\b(?:CAMPGROUND|CAMPSITE|CAMP SITE)\b", regex=True
+            )
+            & has_subaddress
+        )
+        mobile = (
+            combined.str.contains(
+                r"\b(?:MOBILE HOME|TRAILER PARK|MANUFACTURED HOME)\b",
+                regex=True,
+            )
+            & has_subaddress
+        )
+        storage = (
+            combined.str.contains(r"\b(?:STORAGE|WAREHOUSE UNIT)\b", regex=True)
+            & has_subaddress
+        )
 
-        def set_occ(mask: pd.Series, value: str, reason: str, conf: str) -> None:
-            nonlocal occupancy, reasons, confidence
+        def set_occ(
+            mask: pd.Series,
+            value: str,
+            code: str,
+            reason: str,
+            conf: str,
+        ) -> None:
+            nonlocal occupancy, reason_code, reason_text, confidence
             occupancy = occupancy.mask(mask, value)
-            reasons = reasons.mask(mask, reason)
+            reason_code = reason_code.mask(mask, code)
+            reason_text = reason_text.mask(mask, reason)
             confidence = confidence.mask(mask, conf)
 
-        set_occ(apartment, "Residential Apartment or Condominium", "Explicit apartment/condominium unit type", "High")
-        set_occ(residential_side & occupancy.eq("Unknown"), "Residential Side or Duplex Unit", "Explicit upper/lower/front/rear unit type", "High")
-        set_occ(commercial, "Commercial Suite or Office", "Explicit suite/office unit type", "High")
-        set_occ(hotel, "Hotel or Motel Room", "Landmark/classification indicates lodging with a subaddress", "Medium")
-        set_occ(dorm, "Dormitory Room", "Landmark/classification indicates a residence hall", "Medium")
-        set_occ(campground, "Campground Site", "Landmark/classification indicates campground or campsite", "Medium")
-        set_occ(mobile, "Mobile-home or Trailer Site", "Landmark/classification indicates mobile-home/trailer community", "Medium")
-        set_occ(storage, "Storage Unit", "Landmark/classification indicates storage", "Medium")
-        set_occ(has_subaddress & occupancy.eq("Unknown"), "Unknown Unit or Subaddress", "Subaddress exists but source does not establish occupancy type", "Low")
-        set_occ(~has_subaddress, "No Unit Classification", "No subaddress fields are populated", "Not Applicable")
+        set_occ(
+            apartment,
+            "Residential Apartment or Condominium",
+            "explicit_apartment_unit_type",
+            "Explicit apartment or condominium unit type",
+            "High",
+        )
+        set_occ(
+            residential_side & ~apartment,
+            "Residential Side or Duplex Unit",
+            "explicit_residential_position_unit_type",
+            "Explicit upper, lower, front, or rear unit type",
+            "High",
+        )
+        set_occ(
+            commercial,
+            "Commercial Suite or Office",
+            "explicit_suite_or_office_unit_type",
+            "Explicit suite or office unit type",
+            "High",
+        )
+        set_occ(
+            hotel & ~commercial,
+            "Hotel or Motel Room",
+            "lodging_subaddress_evidence",
+            "Lodging classification with a subaddress",
+            "Medium",
+        )
+        set_occ(
+            dorm & ~commercial,
+            "Dormitory Room",
+            "dormitory_subaddress_evidence",
+            "Residence-hall classification with a subaddress",
+            "Medium",
+        )
+        set_occ(
+            campground & ~commercial,
+            "Campground Site",
+            "campground_subaddress_evidence",
+            "Campground classification with a subaddress",
+            "Medium",
+        )
+        set_occ(
+            mobile & ~commercial,
+            "Mobile-home or Trailer Site",
+            "mobile_home_subaddress_evidence",
+            "Mobile-home or trailer-community classification with a subaddress",
+            "Medium",
+        )
+        set_occ(
+            storage & ~commercial,
+            "Storage Unit",
+            "storage_subaddress_evidence",
+            "Storage classification with a subaddress",
+            "Medium",
+        )
+        set_occ(
+            generic_unit
+            & has_subaddress
+            & occupancy.eq("Unknown Unit or Subaddress"),
+            "Unknown Unit or Subaddress",
+            "generic_unit_without_occupancy_evidence",
+            "Generic Unit type without defensible occupancy evidence",
+            "Low",
+        )
 
         frame["Canonical_Occupancy_Category"] = occupancy
-        frame["Canonical_Residential_Unit_Flag"] = occupancy.isin((
-            "Residential Apartment or Condominium", "Residential Side or Duplex Unit", "Dormitory Room",
-        ))
-        frame["Canonical_Commercial_Unit_Flag"] = occupancy.eq("Commercial Suite or Office")
-        frame["Canonical_Apartment_Candidate_Flag"] = occupancy.eq("Residential Apartment or Condominium")
         frame["Canonical_Occupancy_Confidence"] = confidence
-        frame["Canonical_Occupancy_Reasons"] = reasons
+        frame["Canonical_Occupancy_Reason"] = reason_code
+        frame["Canonical_Occupancy_Reasons"] = reason_text
+        frame["Canonical_Residential_Unit_Flag"] = occupancy.isin(
+            (
+                "Residential Apartment or Condominium",
+                "Residential Side or Duplex Unit",
+                "Dormitory Room",
+                "Mobile-home or Trailer Site",
+            )
+        )
+        frame["Canonical_Commercial_Unit_Flag"] = occupancy.eq(
+            "Commercial Suite or Office"
+        )
+        frame["Canonical_Apartment_Candidate_Flag"] = occupancy.eq(
+            "Residential Apartment or Condominium"
+        )
 
-        role = pd.Series("Standalone Address", index=frame.index, dtype="string")
-        role_reason = pd.Series("No unit or specialized placement classification", index=frame.index, dtype="string")
-        role_conf = pd.Series("Medium", index=frame.index, dtype="string")
-        utility = combined.str.contains(r"\b(?:UTILITY|HYDRANT|TOWER|SUBSTATION|TRANSFORMER)\b", regex=True)
-        access = combined.str.contains(r"\b(?:ACCESS POINT|DRIVEWAY|GATE|ENTRANCE)\b", regex=True)
-        building_entrance = combined.str.contains(r"\bBUILDING ENTRANCE\b", regex=True)
-        unit_location = combined.str.contains(r"\bUNIT LOCATION\b", regex=True)
-        parcel = combined.str.contains(r"\b(?:PARCEL|SITE LOCATION|PROPERTY ACCESS)\b", regex=True)
-        landmark_facility = landmark.ne("") & combined.str.contains(r"\b(?:SCHOOL|CHURCH|HOSPITAL|FACILITY|PARK|CAMP|HOTEL|MOTEL)\b", regex=True)
+        # Specialized source evidence intentionally excludes Unit_PreType.
+        # An explicit residential/commercial unit can therefore outrank a parcel,
+        # utility, or access-site source class without generic Unit text creating
+        # false occupancy evidence.
+        parcel_evidence = source_evidence.str.contains(
+            r"\b(?:PARCEL|SITE LOCATION)\b", regex=True
+        )
+        utility_evidence = source_evidence.str.contains(
+            r"\b(?:UTILITY|HYDRANT|TOWER|SUBSTATION|TRANSFORMER|"
+            r"INFRASTRUCTURE)\b",
+            regex=True,
+        )
+        access_evidence = source_evidence.str.contains(
+            r"\b(?:ACCESS POINT|DRIVEWAY|GATE|ENTRANCE|PROPERTY ACCESS|"
+            r"NON[- ]?MAILABLE|NON[- ]?ADDRESSABLE)\b",
+            regex=True,
+        )
         residential_unit = frame["Canonical_Residential_Unit_Flag"]
         commercial_unit = frame["Canonical_Commercial_Unit_Flag"]
-        unknown_unit = has_subaddress & ~residential_unit & ~commercial_unit
+        explicit_unit = residential_unit | commercial_unit
+        any_non_mailable_evidence = (
+            parcel_evidence | utility_evidence | access_evidence
+        )
 
-        def set_role(mask: pd.Series, value: str, reason: str, conf: str) -> None:
-            nonlocal role, role_reason, role_conf
+        role = pd.Series(
+            "Standalone Address", index=frame.index, dtype="string"
+        )
+        role_reason_code = pd.Series(
+            "standalone_without_specialized_evidence",
+            index=frame.index,
+            dtype="string",
+        )
+        role_reason = pd.Series(
+            "No specialized source role matched",
+            index=frame.index,
+            dtype="string",
+        )
+        role_conf = pd.Series("Medium", index=frame.index, dtype="string")
+
+        def set_role(
+            mask: pd.Series,
+            value: str,
+            code: str,
+            reason: str,
+            conf: str,
+        ) -> None:
+            nonlocal role, role_reason_code, role_reason, role_conf
             role = role.mask(mask, value)
+            role_reason_code = role_reason_code.mask(mask, code)
             role_reason = role_reason.mask(mask, reason)
             role_conf = role_conf.mask(mask, conf)
 
-        set_role(residential_unit, "Residential Unit", "Occupancy classification indicates residential unit", "High")
-        set_role(commercial_unit, "Commercial Unit", "Occupancy classification indicates suite or office", "High")
-        set_role(unknown_unit, "Unknown Unit Address", "Subaddress exists but occupancy type is uncertain", "Low")
-        set_role(parcel, "Parcel or Site", "Source classification indicates parcel/site", "Medium")
-        set_role(access, "Access Point", "Source placement/classification indicates access or entrance", "Medium")
-        set_role(building_entrance, "Building Entrance", "Source placement explicitly indicates building entrance", "High")
-        set_role(unit_location, "Unit Location", "Source placement explicitly indicates unit location", "High")
-        set_role(utility, "Utility or Infrastructure", "Source classification indicates utility/infrastructure", "Medium")
-        set_role(landmark_facility & role.eq("Standalone Address"), "Landmark or Facility", "Landmark and facility terms are populated", "Medium")
+        # Priority 2 is applied before Priority 3. Utility is applied last among
+        # non-mailable categories so explicit infrastructure evidence wins when
+        # source values contain several specialized terms.
+        set_role(
+            parcel_evidence,
+            "Parcel or Site",
+            "explicit_parcel_or_site_source_class",
+            "Source classification indicates parcel or site",
+            "Medium",
+        )
+        set_role(
+            access_evidence,
+            "Other Non-Mailable Site",
+            "explicit_access_point_source_class",
+            "Source classification indicates access, entrance, gate, driveway, or another non-mailable site",
+            "Medium",
+        )
+        set_role(
+            utility_evidence,
+            "Utility or Infrastructure",
+            "explicit_utility_source_class",
+            "Source classification indicates utility or infrastructure",
+            "Medium",
+        )
+
+        unknown_unit = (
+            has_subaddress
+            & ~explicit_unit
+            & ~any_non_mailable_evidence
+        )
+        set_role(
+            unknown_unit & ~generic_unit,
+            "Unknown Unit Address",
+            "subaddress_without_occupancy_or_site_evidence",
+            "Subaddress exists but occupancy and specialized-site type remain uncertain",
+            "Low",
+        )
+        set_role(
+            unknown_unit & generic_unit,
+            "Unknown Unit Address",
+            "generic_unit_without_occupancy_evidence",
+            "Generic Unit type exists without defensible occupancy or specialized-site evidence",
+            "Low",
+        )
+
+        # Priority 1 is applied last so defensible occupancy evidence wins over a
+        # conflicting source site class.
+        set_role(
+            residential_unit,
+            "Residential Unit",
+            "explicit_residential_unit_evidence",
+            "Occupancy evidence indicates a residential unit",
+            "High",
+        )
+        set_role(
+            commercial_unit,
+            "Commercial Unit",
+            "explicit_commercial_unit_evidence",
+            "Occupancy evidence indicates a suite or office",
+            "High",
+        )
+        role_reason_code = role_reason_code.mask(
+            explicit_unit,
+            frame["Canonical_Occupancy_Reason"].astype("string"),
+        )
+
         frame["Canonical_Record_Role"] = role
         frame["Canonical_Record_Role_Confidence"] = role_conf
+        frame["Canonical_Record_Role_Reason_Code"] = role_reason_code
         frame["Canonical_Record_Role_Reasons"] = role_reason
         frame["Canonical_Status"] = role
+
+        conflict = has_subaddress & any_non_mailable_evidence
+        frame["Classification_Conflict_Flag"] = conflict
+        frame["Classification_Conflict_Type"] = pd.Series(
+            np.where(
+                conflict,
+                "subaddress_with_explicit_non_mailable_evidence",
+                "",
+            ),
+            index=frame.index,
+            dtype="string",
+        )
+        conflict_category = pd.Series("", index=frame.index, dtype="string")
+        conflict_category = conflict_category.mask(
+            conflict & parcel_evidence, "parcel_or_site"
+        )
+        conflict_category = conflict_category.mask(
+            conflict & access_evidence, "access_or_non_mailable"
+        )
+        conflict_category = conflict_category.mask(
+            conflict & utility_evidence, "utility_or_infrastructure"
+        )
+        frame["Classification_Conflict_Evidence_Category"] = conflict_category
+
+        frame["Source_Parent_Candidate"] = (
+            ~has_subaddress
+            & combined.str.contains(
+                r"\b(?:BUILDING WITH UNITS|BUILDING W/? UNITS|"
+                r"MULTI[- ]UNIT BUILDING)\b",
+                regex=True,
+            )
+        )
 
     def _derive_parent_child(self, frame: "gpd.GeoDataFrame") -> None:
         key = frame["Parent_Group_Key"].astype("string").fillna("")
         has_subaddress = frame["Canonical_Subaddress"].astype("string").ne("")
         valid_key = key.ne("")
         child_count_map = frame.loc[valid_key & has_subaddress].groupby("Parent_Group_Key").size()
+        blank_parent_count_map = frame.loc[valid_key & ~has_subaddress].groupby("Parent_Group_Key").size()
         group_count_map = frame.loc[valid_key].groupby("Parent_Group_Key").size()
         child_count = key.map(child_count_map).fillna(0).astype("int64")
+        parent_count = key.map(blank_parent_count_map).fillna(0).astype("int64")
         group_count = key.map(group_count_map).fillna(0).astype("int64")
-        potential_parent = valid_key & ~has_subaddress & child_count.gt(0)
-        potential_child = valid_key & has_subaddress & group_count.gt(1)
+        inferred_parent = valid_key & ~has_subaddress & child_count.gt(0)
+        source_parent = frame["Source_Parent_Candidate"].fillna(False).astype(bool)
+        potential_parent = inferred_parent | source_parent
+        potential_child = valid_key & has_subaddress & parent_count.gt(0)
+        ambiguity = (potential_child & parent_count.gt(1)) | (potential_parent & child_count.eq(0))
+        conflict = potential_parent & has_subaddress
+
         frame["Potential_Parent_Record"] = potential_parent
         frame["Potential_Child_Record"] = potential_child
         frame["Child_Record_Count"] = child_count
+        frame["Potential_Parent_Count"] = parent_count
+        frame["Parent_Group_Record_Count"] = group_count
+        frame["Parent_Child_Ambiguity_Flag"] = ambiguity
+        frame["Parent_Child_Conflict_Flag"] = conflict
         frame["Parent_Child_Confidence"] = np.where(
-            potential_parent | potential_child,
-            np.where(child_count.ge(2), "High", "Medium"),
-            "Not Applicable",
+            ambiguity | conflict,
+            "Review",
+            np.where(
+                potential_parent | potential_child,
+                np.where(child_count.ge(2) | parent_count.eq(1), "High", "Medium"),
+                "Not Applicable",
+            ),
         )
-        frame["Potential_Double_Count_Flag"] = potential_parent
+        frame["Potential_Double_Count_Flag"] = inferred_parent
         frame.loc[potential_parent, "Canonical_Record_Role"] = "Building Parent"
         frame.loc[potential_parent, "Canonical_Record_Role_Confidence"] = np.where(
             child_count.loc[potential_parent].ge(2), "High", "Medium"
         )
-        frame.loc[potential_parent, "Canonical_Record_Role_Reasons"] = (
-            "Blank-subaddress record shares a normalized building address with child unit records"
+        frame.loc[potential_parent, "Canonical_Record_Role_Reasons"] = np.where(
+            child_count.loc[potential_parent].gt(0),
+            "Blank-subaddress record shares a normalized building address with child-unit records",
+            "Source classification indicates a parent building but no matching child unit was found",
         )
         frame.loc[potential_parent, "Canonical_Status"] = "Building Parent"
 
@@ -1196,42 +1803,84 @@ class WisconsinStatewideNG911Adapter:
         flags = pd.Series("", index=frame.index, dtype="string")
         full_house = frame["Canonical_Full_House_Number"].astype("string").fillna("")
         full_street = frame["Canonical_Full_Street"].astype("string").fillna("")
+        full_address = frame["Canonical_Full_Address"].astype("string").fillna("")
+        mailable_address = frame["Canonical_Mailable_Address"].astype("string").fillna("")
         postal_city = frame["Canonical_Postal_City"].astype("string").fillna("")
         locality = frame["Canonical_Muni"].astype("string").fillna("")
         zip5 = frame["Canonical_Zip_Code"].astype("string").fillna("")
+        state = frame["Canonical_State"].astype("string").fillna("")
+        nguid = clean_series(frame, "NGUID")
         zero_house = full_house.str.fullmatch(r"[A-Z]*0+(?:\.0+)?", na=False)
+        duplicate_nguid = nguid.ne("") & nguid.isin(self.duplicate_nguids)
+        duplicate_source_id = frame["Source_Record_ID"].astype("string").duplicated(keep=False)
+        flags = append_flag_series(flags, nguid.eq(""), "Missing NGUID - FID Fallback Used")
+        flags = append_flag_series(flags, duplicate_nguid, "Duplicate NGUID - Unique Source Record ID Used")
+        flags = append_flag_series(flags, duplicate_source_id, "Duplicate Source Record ID")
         flags = append_flag_series(flags, full_house.eq(""), "Missing House Number")
         flags = append_flag_series(flags, zero_house, "Zero House Number")
         flags = append_flag_series(flags, full_street.eq(""), "Missing Street")
+        flags = append_flag_series(flags, full_address.eq(""), "Missing Full Physical Address")
+        flags = append_flag_series(flags, mailable_address.eq(""), "Missing Mailable Address")
         flags = append_flag_series(flags, postal_city.eq(""), "Missing Postal City")
         flags = append_flag_series(flags, frame["Canonical_Postal_City_Fallback_Flag"], "Postal City Fallback Used")
         flags = append_flag_series(flags, locality.eq(""), "Missing Municipality/Locality")
         flags = append_flag_series(flags, zip5.eq(""), "Missing ZIP")
+        flags = append_flag_series(flags, state.ne(SOURCE_STATE), "Unexpected State Abbreviation")
         flags = append_flag_series(flags, frame["Canonical_ZIP_Quality_Flag"].astype("string").ne("") & ~frame["Canonical_ZIP_Quality_Flag"].astype("string").eq("Missing ZIP"), "Invalid ZIP Value")
         flags = append_flag_series(flags, frame["Canonical_Street_Component_Fallback"], "Full Street Fallback Used")
-        flags = append_flag_series(flags, frame["Canonical_Unit"].astype("string").ne("") & frame["Canonical_UnitType"].astype("string").eq(""), "Unknown Unit Type")
+        flags = append_flag_series(flags, frame["Canonical_Occupancy_Reason"].eq("generic_unit_without_occupancy_evidence"), "Generic Unit Without Occupancy Evidence")
         flags = append_flag_series(flags, frame["Potential_Double_Count_Flag"], "Parent Building with Child Units")
-        flags = append_flag_series(flags, frame["Canonical_Date_Quality_Flags"].astype("string").ne(""), "Invalid or Placeholder Source Date")
+        flags = append_flag_series(flags, frame["Parent_Child_Ambiguity_Flag"], "Parent Child Ambiguity")
+        flags = append_flag_series(flags, frame["Parent_Child_Conflict_Flag"], "Conflicting Parent Child Evidence")
+        flags = append_flag_series(flags, frame["Canonical_Date_Quality_Flags"].astype("string").ne(""), "Source Date Anomaly")
         flags = append_flag_series(flags, frame["Source_Coordinate_Difference_Meters"].gt(100), "Source Coordinates Disagree with Geometry")
-        flags = append_flag_series(flags, frame["Canonical_Record_Role_Confidence"].isin(("Low", "Unclassified")), "Unknown or Low-Confidence Record Role")
+        flags = append_flag_series(flags, frame["Canonical_Record_Role_Confidence"].eq("Low"), "Low-Confidence Record Role")
+        flags = append_flag_series(
+            flags,
+            frame["Classification_Conflict_Flag"].fillna(False).astype(bool),
+            "Subaddress with Explicit Non-Mailable Source Evidence",
+        )
         flags = append_flag_series(flags, ~geometry_good, "Geometry Quality Failure")
         duplicate_address = frame["Normalized_Address_Key"].astype("string").ne("") & frame["Normalized_Address_Key"].duplicated(keep=False)
         flags = append_flag_series(flags, duplicate_address, "Potential Duplicate Normalized Address")
         frame["Canonical_Quality_Flags"] = flags
+
         frame["Canonical_Address_Quality_Status"] = np.where(
-            full_house.ne("") & full_street.ne(""), "Usable", "Review"
+            full_house.ne("") & full_street.ne("") & full_address.ne(""), "Usable", "Review"
         )
         frame["Canonical_Geometry_Quality_Status"] = np.where(geometry_good, "Usable", "Quarantine")
         frame["Canonical_Classification_Quality_Status"] = np.where(
-            frame["Canonical_Record_Role_Confidence"].isin(("High", "Medium", "Not Applicable")),
+            frame["Canonical_Record_Role_Confidence"].isin(("High", "Medium", "Not Applicable"))
+            & ~frame["Parent_Child_Ambiguity_Flag"]
+            & ~frame["Parent_Child_Conflict_Flag"],
             "Usable",
             "Review",
         )
         frame["Canonical_Postal_Quality_Status"] = np.where(
-            postal_city.ne("") & zip5.ne(""),
+            postal_city.ne("") & zip5.ne("") & state.eq(SOURCE_STATE),
             "Complete",
             np.where(locality.ne("") | zip5.ne(""), "Partial", "Missing"),
         )
+
+        role = frame["Canonical_Record_Role"].astype("string")
+        handling = pd.Series("include_standard", index=frame.index, dtype="string")
+        handling = handling.mask(role.isin(("Residential Unit", "Commercial Unit")), "include_unit")
+        handling = handling.mask(role.eq("Unknown Unit Address"), "manual_review")
+        handling = handling.mask(role.eq("Building Parent"), "include_parent_for_review")
+        handling = handling.mask(role.isin(("Parcel or Site", "Utility or Infrastructure", "Other Non-Mailable Site")), "exclude_default")
+        handling = handling.mask(frame["Canonical_Address_Quality_Status"].eq("Review") & handling.eq("include_standard"), "manual_review")
+        handling = handling.mask(frame["Canonical_Critical_Failure_Flag"], "quarantine")
+        exclusion = pd.Series("none", index=frame.index, dtype="string")
+        exclusion = exclusion.mask(role.eq("Parcel or Site"), "parcel_or_site")
+        exclusion = exclusion.mask(role.eq("Utility or Infrastructure"), "utility_or_infrastructure")
+        exclusion = exclusion.mask(role.eq("Other Non-Mailable Site"), "other_non_mailable_site")
+        exclusion = exclusion.mask(role.eq("Building Parent"), "parent_building_review")
+        exclusion = exclusion.mask(role.eq("Unknown Unit Address"), "unknown_unit_review")
+        exclusion = exclusion.mask(frame["Canonical_Critical_Failure_Flag"], "critical_geometry_failure")
+        frame["Canonical_Analyzer_Handling"] = handling
+        frame["Canonical_Exclusion_Category"] = exclusion
+        frame["Canonical_Analyzer_Eligible"] = ~handling.isin(("exclude_default", "quarantine"))
+
         address_review = frame["Canonical_Address_Quality_Status"].eq("Review")
         frame.loc[address_review & frame["Canonical_Eligibility_Status"].eq("Technically Usable"), "Canonical_Eligibility_Status"] = "Review - Address Quality"
 
@@ -1246,42 +1895,87 @@ class WisconsinStatewideNG911Adapter:
         source_count = len(full)
         runtime_count = len(runtime)
         quarantine_count = len(quarantine)
+
         def count_true(column: str) -> int:
             return int(full[column].fillna(False).astype(bool).sum()) if column in full.columns else 0
-        zip_complete = float(full["Canonical_Zip_Code"].astype("string").ne("").mean()) if source_count else 0.0
-        postal_complete = float(full["Canonical_Postal_City"].astype("string").ne("").mean()) if source_count else 0.0
-        locality_complete = float(full["Canonical_Muni"].astype("string").ne("").mean()) if source_count else 0.0
-        street_complete = float(full["Canonical_Full_Street"].astype("string").ne("").mean()) if source_count else 0.0
-        nguid_complete = float(full["NGUID"].astype("string").fillna("").ne("").mean()) if source_count else 0.0
+
+        def completeness(column: str) -> float:
+            if not source_count or column not in full.columns:
+                return 0.0
+            return float(clean_series(full, column).ne("").mean())
+
+        nguid = clean_series(full, "NGUID")
         latest_update = full["DateUpdate_Parsed"].dropna().max()
+        geometry_usable = full["Canonical_Geometry_Quality_Status"].eq("Usable")
+        duplicate_nguid_records = nguid.ne("") & nguid.isin(self.duplicate_nguids)
+        source_record_ids = clean_series(full, "Source_Record_ID")
+        warning_records = full["Canonical_Quality_Flags"].astype("string").fillna("").ne("")
+        technical_warning_count = (
+            quarantine_count
+            + int(nguid.eq("").sum())
+            + int(duplicate_nguid_records.sum())
+            + int(source_record_ids.duplicated(keep=False).sum())
+        )
         metrics: dict[str, Any] = {
             "source_record_count": source_count,
             "runtime_record_count": runtime_count,
             "quarantine_record_count": quarantine_count,
-            "nguid_completeness": nguid_complete,
-            "nguid_unique": bool(full["NGUID"].astype("string").fillna("").is_unique),
-            "geometry_completeness": float(full.geometry.notna().mean()) if source_count else 0.0,
-            "bounds": tuple(float(v) for v in full.total_bounds) if source_count else None,
+            "reconciliation_passed": source_count == runtime_count + quarantine_count,
+            "nguid_completeness": float(nguid.ne("").mean()) if source_count else 0.0,
+            "missing_nguid_count": int(nguid.eq("").sum()),
+            "duplicate_nguid_record_count": int(duplicate_nguid_records.sum()),
+            "duplicate_source_record_id_count": int(source_record_ids.duplicated(keep=False).sum()),
+            "source_record_id_unique": bool(source_record_ids.ne("").all() and source_record_ids.is_unique),
+            "geometry_completeness": float(geometry_usable.mean()) if source_count else 0.0,
+            "bounds": tuple(float(v) for v in runtime.total_bounds) if runtime_count else None,
             "zero_house_number_count": int(full["Canonical_Full_House_Number"].astype("string").str.fullmatch(r"[A-Z]*0+(?:\.0+)?", na=False).sum()),
             "missing_street_count": int(full["Canonical_Full_Street"].astype("string").eq("").sum()),
+            "missing_full_address_count": int(full["Canonical_Full_Address"].astype("string").eq("").sum()),
+            "missing_mailable_address_count": int(full["Canonical_Mailable_Address"].astype("string").eq("").sum()),
             "unit_address_count": int(full["Canonical_Subaddress"].astype("string").ne("").sum()),
             "residential_unit_candidate_count": count_true("Canonical_Residential_Unit_Flag"),
             "commercial_unit_candidate_count": count_true("Canonical_Commercial_Unit_Flag"),
             "apartment_candidate_count": count_true("Canonical_Apartment_Candidate_Flag"),
             "parent_building_count": count_true("Potential_Parent_Record"),
+            "potential_child_count": count_true("Potential_Child_Record"),
             "potential_double_count_count": count_true("Potential_Double_Count_Flag"),
+            "parent_child_ambiguity_count": count_true("Parent_Child_Ambiguity_Flag"),
             "landmark_count": int(full["Canonical_Landmark_Name"].astype("string").ne("").sum()),
-            "zip_completeness": zip_complete,
+            "zip_completeness": completeness("Canonical_Zip_Code"),
             "zip4_count": int(full["Canonical_ZIP4"].astype("string").ne("").sum()),
-            "postal_city_completeness": postal_complete,
+            "postal_city_completeness": completeness("Canonical_Postal_City"),
             "locality_fallback_count": count_true("Canonical_Postal_City_Fallback_Flag"),
-            "municipality_locality_completeness": locality_complete,
-            "street_completeness": street_complete,
+            "municipality_locality_completeness": completeness("Canonical_Muni"),
+            "street_completeness": completeness("Canonical_Full_Street"),
             "invalid_date_count": int(full["Canonical_Date_Quality_Flags"].astype("string").ne("").sum()),
             "future_effective_count": int(full["Canonical_Active_Status"].eq("Future Effective").sum()),
             "expired_count": int(full["Canonical_Active_Status"].eq("Expired").sum()),
             "latest_plausible_dateupdate": latest_update.isoformat() if pd.notna(latest_update) else None,
-            "unknown_classification_count": int(full["Canonical_Record_Role_Confidence"].isin(("Low", "Unclassified")).sum()),
+            "unknown_classification_count": int(full["Canonical_Record_Role"].eq("Unknown Unit Address").sum()),
+            "unknown_unit_count": int(full["Canonical_Record_Role"].eq("Unknown Unit Address").sum()),
+            "warning_count": int(warning_records.sum()),
+            "technical_warning_count": technical_warning_count,
+            "classification_conflict_count": count_true("Classification_Conflict_Flag"),
+            "subaddress_with_parcel_or_site_count": int(
+                full["Classification_Conflict_Evidence_Category"]
+                .astype("string")
+                .eq("parcel_or_site")
+                .sum()
+            ),
+            "subaddress_with_utility_or_infrastructure_count": int(
+                full["Classification_Conflict_Evidence_Category"]
+                .astype("string")
+                .eq("utility_or_infrastructure")
+                .sum()
+            ),
+            "subaddress_with_access_or_non_mailable_count": int(
+                full["Classification_Conflict_Evidence_Category"]
+                .astype("string")
+                .eq("access_or_non_mailable")
+                .sum()
+            ),
+            "runtime_column_count": len(runtime.columns),
+            "full_fidelity_column_count": len(full.columns),
         }
         self._populate_reports(county, full, quarantine, reports)
         return metrics
@@ -1298,7 +1992,10 @@ class WisconsinStatewideNG911Adapter:
             if column not in full.columns:
                 continue
             null_count = int(full[column].isna().sum())
-            blank_count = int(clean_series(full, column).eq("").sum()) if full[column].dtype == object or str(full[column].dtype).startswith("string") else null_count
+            if full[column].dtype == object or str(full[column].dtype).startswith("string"):
+                blank_count = int(clean_series(full, column).eq("").sum())
+            else:
+                blank_count = null_count
             reports.field_completeness.append({
                 "county": county,
                 "field": column,
@@ -1318,29 +2015,127 @@ class WisconsinStatewideNG911Adapter:
                     "pct": float(count / total) if total else 0.0,
                 })
         for value, count in full["Canonical_Record_Role"].value_counts(dropna=False).items():
-            reports.record_role_summary.append({"county": county, "record_role": value, "count": int(count), "pct": float(count / total) if total else 0.0})
-        for value, count in full["Canonical_Occupancy_Category"].value_counts(dropna=False).items():
-            reports.occupancy_summary.append({"county": county, "occupancy_category": value, "count": int(count), "pct": float(count / total) if total else 0.0})
+            reports.record_role_summary.append({
+                "county": county,
+                "record_role": value,
+                "count": int(count),
+                "pct": float(count / total) if total else 0.0,
+            })
+        occupancy_groups = full.groupby(
+            ["Canonical_Occupancy_Category", "Canonical_Occupancy_Confidence", "Canonical_Occupancy_Reason"],
+            dropna=False,
+        ).size().sort_values(ascending=False)
+        for (category, confidence, reason), count in occupancy_groups.items():
+            reports.occupancy_summary.append({
+                "county": county,
+                "occupancy_category": category,
+                "occupancy_confidence": confidence,
+                "occupancy_reason": reason,
+                "count": int(count),
+                "pct": float(count / total) if total else 0.0,
+            })
+
+        conflict_mask = full[
+            "Classification_Conflict_Flag"
+        ].fillna(False).astype(bool)
+        conflict_rows = full.loc[conflict_mask].head(
+            MAX_DETAIL_REPORT_ROWS_PER_COUNTY
+        )
+        for row in conflict_rows[
+            [
+                "Source_Record_ID",
+                "NGUID",
+                "Source_Place_Type",
+                "Source_Placement",
+                "Source_Structure",
+                "Source_Exception",
+                "Canonical_UnitType",
+                "Canonical_Unit",
+                "Canonical_Subaddress",
+                "Canonical_Record_Role",
+                "Canonical_Record_Role_Reason_Code",
+                "Canonical_Analyzer_Handling",
+                "Canonical_Exclusion_Category",
+                "Classification_Conflict_Type",
+            ]
+        ].to_dict("records"):
+            reports.classification_conflicts.append({
+                "county": county,
+                "source_record_id": row.get("Source_Record_ID"),
+                "nguid": row.get("NGUID"),
+                "source_place_type": row.get("Source_Place_Type"),
+                "source_placement": row.get("Source_Placement"),
+                "source_structure": row.get("Source_Structure"),
+                "source_exception": row.get("Source_Exception"),
+                "unit_type": row.get("Canonical_UnitType"),
+                "unit_value": row.get("Canonical_Unit"),
+                "subaddress": row.get("Canonical_Subaddress"),
+                "selected_record_role": row.get("Canonical_Record_Role"),
+                "classification_reason": row.get(
+                    "Canonical_Record_Role_Reason_Code"
+                ),
+                "analyzer_handling": row.get(
+                    "Canonical_Analyzer_Handling"
+                ),
+                "exclusion_category": row.get(
+                    "Canonical_Exclusion_Category"
+                ),
+                "conflict_type": row.get("Classification_Conflict_Type"),
+            })
+
+        potential_parent = full["Potential_Parent_Record"].fillna(False).astype(bool)
+        potential_child = full["Potential_Child_Record"].fillna(False).astype(bool)
+        source_parent = full["Source_Parent_Candidate"].fillna(False).astype(bool)
+        child_count = full["Child_Record_Count"].fillna(0).astype(int)
+        parent_count = full["Potential_Parent_Count"].fillna(0).astype(int)
+        conflict = full["Parent_Child_Ambiguity_Flag"].fillna(False).astype(bool) | full["Parent_Child_Conflict_Flag"].fillna(False).astype(bool)
         reports.parent_child_summary.append({
             "county": county,
-            "potential_parent_records": int(full["Potential_Parent_Record"].sum()),
-            "potential_child_records": int(full["Potential_Child_Record"].sum()),
-            "potential_double_count_records": int(full["Potential_Double_Count_Flag"].sum()),
-            "parent_groups": int(full.loc[full["Potential_Parent_Record"], "Parent_Group_Key"].nunique()),
+            "potential_parent_records": int(potential_parent.sum()),
+            "potential_child_records": int(potential_child.sum()),
+            "source_parent_candidates": int(source_parent.sum()),
+            "parent_records_zero_matching_children": int((source_parent & child_count.eq(0)).sum()),
+            "parent_records_one_matching_child": int((potential_parent & child_count.eq(1)).sum()),
+            "parent_records_multiple_matching_children": int((potential_parent & child_count.gt(1)).sum()),
+            "children_one_possible_parent": int((potential_child & parent_count.eq(1)).sum()),
+            "children_multiple_possible_parents": int((potential_child & parent_count.gt(1)).sum()),
+            "potential_double_count_records": int(full["Potential_Double_Count_Flag"].fillna(False).astype(bool).sum()),
+            "conflicting_parent_child_records": int(conflict.sum()),
+            "parent_groups": int(full.loc[potential_parent, "Parent_Group_Key"].nunique()),
         })
+
         date_anomaly = full[full["Canonical_Date_Quality_Flags"].astype("string").ne("")].head(MAX_DETAIL_REPORT_ROWS_PER_COUNTY)
-        for row in date_anomaly[["NGUID", "DateUpdate_Raw", "Effective_Raw", "Expire_Raw", "Canonical_Date_Quality_Flags"]].to_dict("records"):
+        date_columns = ["Source_Record_ID", "NGUID", "DateUpdate_Raw", "Effective_Raw", "Expire_Raw", "Canonical_Date_Quality_Flags"]
+        for row in date_anomaly[date_columns].to_dict("records"):
             reports.date_anomalies.append({"county": county, **row})
-        coordinate_anomaly = full[full["Source_Coordinate_Difference_Meters"].gt(100)].nlargest(MAX_DETAIL_REPORT_ROWS_PER_COUNTY, "Source_Coordinate_Difference_Meters")
-        for row in coordinate_anomaly[["NGUID", "Source_Lat", "Source_Long", "Canonical_Latitude", "Canonical_Longitude", "Source_Coordinate_Difference_Meters"]].to_dict("records"):
-            reports.coordinate_anomalies.append({"county": county, **row})
+
+        coordinate_mask = (
+            full["Source_Coordinate_Difference_Meters"].gt(100)
+            | full["Canonical_Critical_Failure_Flag"].fillna(False).astype(bool)
+        )
+        coordinate_anomaly = full.loc[coordinate_mask].copy().head(MAX_DETAIL_REPORT_ROWS_PER_COUNTY)
+        for row in coordinate_anomaly[
+            ["Source_Record_ID", "NGUID", "Source_Lat", "Source_Long", "Canonical_Latitude", "Canonical_Longitude", "Source_Coordinate_Difference_Meters", "Quarantine_Reasons"]
+        ].to_dict("records"):
+            reason = row.pop("Quarantine_Reasons") or "Source coordinates differ from geometry by more than 100 meters"
+            reports.coordinate_anomalies.append({"county": county, **row, "anomaly_reason": reason})
+
         duplicate_counts = full.loc[full["Normalized_Address_Key"].astype("string").ne("")].groupby("Normalized_Address_Key").size()
         duplicate_counts = duplicate_counts[duplicate_counts.gt(1)].sort_values(ascending=False).head(MAX_DETAIL_REPORT_ROWS_PER_COUNTY)
         for address_key, count in duplicate_counts.items():
-            reports.duplicate_address_summary.append({"county": county, "normalized_address_key": address_key, "record_count": int(count)})
+            reports.duplicate_address_summary.append({
+                "county": county,
+                "normalized_address_key": address_key,
+                "record_count": int(count),
+            })
         fallback_counts = full["Canonical_Locality_Source"].replace("", "[NONE]").value_counts()
         for source_name, count in fallback_counts.items():
-            reports.postal_fallback_summary.append({"county": county, "locality_source": source_name, "count": int(count), "pct": float(count / total) if total else 0.0})
+            reports.postal_fallback_summary.append({
+                "county": county,
+                "locality_source": source_name,
+                "count": int(count),
+                "pct": float(count / total) if total else 0.0,
+            })
         if quarantine.empty:
             reports.quarantine_summary.append({"county": county, "quarantine_reason": "[NONE]", "count": 0})
         else:
@@ -1377,6 +2172,32 @@ def normalize_key(value: Any) -> str:
     text = "".join(character for character in text if not unicodedata.combining(character))
     return re.sub(r"[^A-Z0-9]+", "", text)
 
+
+
+def coerce_runtime_schema(frame: "gpd.GeoDataFrame") -> "gpd.GeoDataFrame":
+    """Create the stable, ordered, lean runtime contract for every county."""
+    work = frame.copy()
+    for column in RUNTIME_COLUMNS:
+        if column not in work.columns:
+            if column == "geometry":
+                raise ValidationError("Runtime source is missing geometry")
+            work[column] = pd.NA
+    for column, dtype in RUNTIME_DTYPES.items():
+        if column not in work.columns:
+            continue
+        if dtype == "string":
+            work[column] = work[column].astype("string").fillna("")
+        elif dtype == "boolean":
+            work[column] = work[column].fillna(False).astype("boolean")
+        elif dtype == "Int64":
+            work[column] = pd.to_numeric(work[column], errors="coerce").fillna(0).astype("Int64")
+        elif dtype == "float64":
+            work[column] = pd.to_numeric(work[column], errors="coerce").astype("float64")
+    return gpd.GeoDataFrame(
+        work.loc[:, list(RUNTIME_COLUMNS)],
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
 
 def haversine_meters(lon1: Any, lat1: Any, lon2: Any, lat2: Any) -> "np.ndarray":
     radius = 6_371_008.8
@@ -1484,15 +2305,36 @@ def parquet_null_counts(path: Path, columns: Sequence[str]) -> dict[str, int]:
     return counts
 
 
-def geometry_map(frame: "gpd.GeoDataFrame") -> dict[str, str]:
-    ids = clean_series(frame, "NGUID")
+def geometry_hash_map(frame: "gpd.GeoDataFrame", id_column: str = "Source_Record_ID") -> dict[str, str]:
+    ids = clean_series(frame, id_column)
     result: dict[str, str] = {}
-    for nguid, geometry in zip(ids, frame.geometry, strict=False):
-        if not nguid:
+    for record_id, geometry in zip(ids, frame.geometry, strict=False):
+        if not record_id:
             continue
         payload = b"" if geometry is None else geometry.wkb
-        result[nguid] = hashlib.sha256(payload).hexdigest()
+        result[record_id] = hashlib.sha256(payload).hexdigest()
     return result
+
+
+def validate_geometry_frame(frame: "gpd.GeoDataFrame", label: str, require_wisconsin: bool = True) -> None:
+    if "geometry" not in frame.columns:
+        raise ValidationError(f"{label} has no geometry column")
+    if frame.crs is None or frame.crs.to_epsg() != 4326:
+        raise ValidationError(f"{label} CRS mismatch: {frame.crs}")
+    if frame.geometry.isna().any() or frame.geometry.is_empty.any():
+        raise ValidationError(f"{label} contains null or empty geometry")
+    if not frame.geometry.geom_type.eq("Point").all():
+        raise ValidationError(f"{label} contains non-Point geometry")
+    x = frame.geometry.x.to_numpy(dtype="float64")
+    y = frame.geometry.y.to_numpy(dtype="float64")
+    if not np.isfinite(x).all() or not np.isfinite(y).all():
+        raise ValidationError(f"{label} contains nonfinite coordinates")
+    if not ((x >= -180) & (x <= 180) & (y >= -90) & (y <= 90)).all():
+        raise ValidationError(f"{label} contains coordinates outside valid global ranges")
+    if require_wisconsin and len(frame):
+        minx, miny, maxx, maxy = DEFAULT_WISCONSIN_BOUNDS
+        if not ((x >= minx) & (x <= maxx) & (y >= miny) & (y <= maxy)).all():
+            raise ValidationError(f"{label} contains coordinates outside the Wisconsin envelope")
 
 
 def validate_full_fidelity(
@@ -1501,32 +2343,55 @@ def validate_full_fidelity(
     source_fields: Sequence[str],
 ) -> list[str]:
     messages: list[str] = []
-    metadata = pq.ParquetFile(parquet_path).metadata
+    parquet_file = pq.ParquetFile(parquet_path)
+    metadata = parquet_file.metadata
     if metadata.num_rows != len(source):
         raise ValidationError(f"Full-fidelity row count mismatch: {metadata.num_rows:,} vs {len(source):,}")
-    schema_names = set(pq.ParquetFile(parquet_path).schema_arrow.names)
+    schema_names = set(parquet_file.schema_arrow.names)
     missing_source_fields = [field for field in source_fields if field not in schema_names]
     if missing_source_fields:
         raise ValidationError("Full-fidelity output lost source fields: " + ", ".join(missing_source_fields))
+    required_derived = ("Source_FID", "Source_Record_ID", "Canonical_Native_Source_ID", "Quarantine_Reasons", "geometry")
+    missing_derived = [field for field in required_derived if field not in schema_names]
+    if missing_derived:
+        raise ValidationError("Full-fidelity output is missing required preservation fields: " + ", ".join(missing_derived))
     source_nulls = {field: int(source[field].isna().sum()) for field in source_fields}
     output_nulls = parquet_null_counts(parquet_path, source_fields)
     mismatches = [field for field in source_fields if source_nulls[field] != output_nulls.get(field, -1)]
     if mismatches:
         raise ValidationError("Full-fidelity null-count mismatch in fields: " + ", ".join(mismatches[:20]))
-    output_identity = gpd.read_parquet(parquet_path, columns=["NGUID", "geometry"])
-    source_ids = set(clean_series(source, "NGUID"))
-    output_ids = set(clean_series(output_identity, "NGUID"))
-    if source_ids != output_ids:
-        raise ValidationError("Full-fidelity NGUID set does not match source")
-    if geometry_map(source) != geometry_map(output_identity):
+    output_identity = gpd.read_parquet(parquet_path, columns=["Source_Record_ID", "geometry"])
+    source_ids = clean_series(source, "Source_Record_ID")
+    output_ids = clean_series(output_identity, "Source_Record_ID")
+    if source_ids.eq("").any() or not source_ids.is_unique:
+        raise ValidationError("In-memory full-fidelity Source_Record_ID is blank or non-unique")
+    if set(source_ids) != set(output_ids):
+        raise ValidationError("Full-fidelity Source_Record_ID set does not match source")
+    if geometry_hash_map(source) != geometry_hash_map(output_identity):
         raise ValidationError("Full-fidelity geometry hash map does not match source")
-    if str(output_identity.crs).upper() != "EPSG:4326":
+    if output_identity.crs is None or output_identity.crs.to_epsg() != 4326:
         raise ValidationError(f"Full-fidelity CRS mismatch: {output_identity.crs}")
-    if len(source):
-        if not np.allclose(source.total_bounds, output_identity.total_bounds, equal_nan=True, atol=1e-12):
-            raise ValidationError("Full-fidelity total bounds changed")
-    messages.append("Full-fidelity record, field, null, NGUID, CRS, bounds, and geometry checks passed")
+    if len(source) and not np.allclose(source.total_bounds, output_identity.total_bounds, equal_nan=True, atol=1e-12):
+        raise ValidationError("Full-fidelity total bounds changed")
+    messages.append("Full-fidelity record, source-field, null, identity, CRS, bounds, and geometry checks passed")
     return messages
+
+
+def validate_runtime_arrow_schema(path: Path) -> None:
+    schema = pq.ParquetFile(path).schema_arrow
+    logical_names = [name for name in schema.names if name != "bbox"]
+    if logical_names != list(RUNTIME_COLUMNS):
+        raise ValidationError("Runtime schema order does not match the versioned RUNTIME_SCHEMA contract")
+    for field_name, dtype in RUNTIME_DTYPES.items():
+        arrow_type = schema.field(field_name).type
+        if dtype == "string" and not (pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type)):
+            raise ValidationError(f"Runtime field {field_name} expected string but found {arrow_type}")
+        if dtype == "boolean" and not pa.types.is_boolean(arrow_type):
+            raise ValidationError(f"Runtime field {field_name} expected boolean but found {arrow_type}")
+        if dtype == "Int64" and not pa.types.is_integer(arrow_type):
+            raise ValidationError(f"Runtime field {field_name} expected integer but found {arrow_type}")
+        if dtype == "float64" and not pa.types.is_floating(arrow_type):
+            raise ValidationError(f"Runtime field {field_name} expected floating point but found {arrow_type}")
 
 
 def validate_runtime(
@@ -1541,21 +2406,26 @@ def validate_runtime(
         raise ValidationError(
             f"Reconciliation failed: source {len(source):,} != runtime {len(runtime):,} + quarantine {len(quarantine):,}"
         )
+    runtime_ids = clean_series(runtime, "Source_Record_ID")
+    quarantine_ids = clean_series(quarantine, "Source_Record_ID")
+    if set(runtime_ids) & set(quarantine_ids):
+        raise ValidationError("A Source_Record_ID appears in both runtime and quarantine")
+    validate_runtime_arrow_schema(runtime_path)
     output = gpd.read_parquet(runtime_path)
     missing = [column for column in CURRENT_ANALYZER_COLUMNS if column not in output.columns]
     if missing:
         raise ValidationError("Runtime output is missing current Analyzer columns: " + ", ".join(missing))
     if len(output) != len(runtime):
         raise ValidationError("Runtime output row count mismatch")
-    source_ids = set(clean_series(runtime, "NGUID"))
-    output_ids = set(clean_series(output, "NGUID"))
-    if source_ids != output_ids:
-        raise ValidationError("Runtime NGUID set mismatch")
-    record_ids = clean_series(output, "Source_Record_ID")
-    if record_ids.eq("").any() or not record_ids.is_unique:
+    output_ids = clean_series(output, "Source_Record_ID")
+    if output_ids.eq("").any() or not output_ids.is_unique:
         raise ValidationError("Runtime Source_Record_ID is missing or non-unique")
-    if str(output.crs).upper() != "EPSG:4326":
-        raise ValidationError(f"Runtime CRS mismatch: {output.crs}")
+    if set(runtime_ids) != set(output_ids):
+        raise ValidationError("Runtime Source_Record_ID set mismatch")
+    if output["Canonical_Critical_Failure_Flag"].fillna(False).astype(bool).any():
+        raise ValidationError("Runtime contains records marked with a critical failure")
+    validate_geometry_frame(output, "Runtime output", require_wisconsin=True)
+
     bbox_validated = False
     if covering_bbox_written and not runtime.empty:
         sample_point = runtime.geometry.iloc[len(runtime) // 2]
@@ -1576,22 +2446,51 @@ def validate_runtime(
         messages.append("Empty runtime file has covering-bbox metadata; no subset test required")
     else:
         messages.append("Covering-bbox metadata was not available; spatial pushdown is not claimed")
-    messages.append("Runtime reconciliation, identity, required-column, and CRS checks passed")
+    messages.append("Runtime reconciliation, stable schema, identity, geometry, Analyzer-column, and CRS checks passed")
     return messages, bbox_validated
+
+
+def validate_quarantine(quarantine: "gpd.GeoDataFrame", path: Path) -> None:
+    output = gpd.read_parquet(path)
+    if len(output) != len(quarantine):
+        raise ValidationError("Quarantine row count mismatch")
+    record_ids = clean_series(output, "Source_Record_ID")
+    if record_ids.eq("").any() or not record_ids.is_unique:
+        raise ValidationError("Quarantine Source_Record_ID is missing or non-unique")
+    if not output["Canonical_Critical_Failure_Flag"].fillna(False).astype(bool).all():
+        raise ValidationError("Quarantine contains a record without a critical-failure flag")
+    if output["Quarantine_Reasons"].astype("string").fillna("").eq("").any():
+        raise ValidationError("Quarantine contains a record without a quarantine reason")
+    if output.crs is None or output.crs.to_epsg() != 4326:
+        raise ValidationError(f"Quarantine CRS mismatch: {output.crs}")
 
 
 def finalize_parquet(temporary: Path, destination: Path) -> None:
     os.replace(temporary, destination)
 
 
-def file_record(path: Path, county: str, file_type: str) -> dict[str, Any]:
+def file_record(
+    path: Path,
+    output_root: Path,
+    county: str,
+    output_type: str,
+    schema_version: str,
+) -> dict[str, Any]:
+    parquet_file = pq.ParquetFile(path)
+    crs_value = "EPSG:4326"
     return {
         "county": county,
-        "file_type": file_type,
-        "path": str(path),
-        "filename": path.name,
-        "byte_size": path.stat().st_size,
+        "output_type": output_type,
+        "relative_path": portable_relative_path(path, output_root),
+        "file_size_bytes": path.stat().st_size,
         "sha256": sha256_file(path),
+        "row_count": parquet_file.metadata.num_rows,
+        "column_count": len([name for name in parquet_file.schema_arrow.names if name != "bbox"]),
+        "crs": crs_value,
+        "created_timestamp_utc": utc_now_iso(),
+        "schema_version": schema_version,
+        "classification_rule_version": CLASSIFICATION_RULE_VERSION,
+        "row_group_count": parquet_file.metadata.num_row_groups,
     }
 
 
@@ -1600,21 +2499,28 @@ def process_county(
     adapter: WisconsinStatewideNG911Adapter,
     config: PipelineConfig,
     reports: ReportStore,
+    expected_inventory_count: int,
+    overwrite_existing: bool = False,
 ) -> CountyOutput:
+    started = time.perf_counter()
     source = adapter.read_county(county)
-    expected_count = sum(1 for _ in range(len(source)))
-    LOGGER.info("%s County source records: %s", county, f"{expected_count:,}")
+    LOGGER.info("%s County source records: %s", county, f"{len(source):,}")
+    if len(source) != expected_inventory_count:
+        raise ValidationError(
+            f"County read count {len(source):,} does not match statewide inventory count {expected_inventory_count:,}"
+        )
     full, runtime, quarantine, metrics = adapter.standardize_county(county, source, reports)
+    metrics["_full_fidelity_columns"] = list(full.columns)
     output_paths: dict[str, Path | None] = {"full_fidelity": None, "runtime": None, "quarantine": None}
-    hashes: dict[str, str | None] = {"full_fidelity": None, "runtime": None, "quarantine": None}
-    sizes: dict[str, int | None] = {"full_fidelity": None, "runtime": None, "quarantine": None}
+    temp_paths: dict[str, Path] = {}
     messages: list[str] = []
     covering_bbox_written = False
     bbox_validated = False
+    effective_overwrite = config.overwrite or overwrite_existing
 
     full_destination = config.output_dir / "full_fidelity" / f"{county_slug(county)}.parquet"
     runtime_destination = config.output_dir / "runtime" / f"{county_slug(county)}.parquet"
-    quarantine_destination = config.output_dir / "quarantine" / f"{county_slug(county)}_quarantine.parquet"
+    quarantine_destination = config.output_dir / "quarantine" / f"{county_slug(county)}.parquet"
 
     planned_outputs: list[Path] = []
     if not config.runtime_only:
@@ -1624,76 +2530,100 @@ def process_county(
     if not quarantine.empty:
         planned_outputs.append(quarantine_destination)
     for planned_output in planned_outputs:
-        ensure_output_allowed(planned_output, config.overwrite)
+        ensure_output_allowed(planned_output, effective_overwrite)
 
-    temporary_files: list[Path] = []
     try:
         if not config.runtime_only:
-            full_temp, _ = write_geoparquet_atomic(full, full_destination, config.row_group_size, config.overwrite, True)
-            temporary_files.append(full_temp)
+            full_temp, _ = write_geoparquet_atomic(
+                full, full_destination, config.row_group_size, effective_overwrite, True
+            )
+            temp_paths["full_fidelity"] = full_temp
             messages.extend(validate_full_fidelity(full, full_temp, adapter.metadata.source_fields))
-            finalize_parquet(full_temp, full_destination)
-            temporary_files.remove(full_temp)
-            output_paths["full_fidelity"] = full_destination
-            record = file_record(full_destination, county, "full_fidelity")
-            reports.output_files.append(record)
-            hashes["full_fidelity"] = record["sha256"]
-            sizes["full_fidelity"] = record["byte_size"]
 
         if not config.full_fidelity_only:
-            runtime_temp, covering_bbox_written = write_geoparquet_atomic(runtime, runtime_destination, config.row_group_size, config.overwrite, True)
-            temporary_files.append(runtime_temp)
-            runtime_messages, bbox_validated = validate_runtime(full, runtime, quarantine, runtime_temp, covering_bbox_written)
+            runtime_temp, covering_bbox_written = write_geoparquet_atomic(
+                runtime, runtime_destination, config.row_group_size, effective_overwrite, True
+            )
+            temp_paths["runtime"] = runtime_temp
+            runtime_messages, bbox_validated = validate_runtime(
+                full, runtime, quarantine, runtime_temp, covering_bbox_written
+            )
             messages.extend(runtime_messages)
-            finalize_parquet(runtime_temp, runtime_destination)
-            temporary_files.remove(runtime_temp)
-            output_paths["runtime"] = runtime_destination
-            record = file_record(runtime_destination, county, "runtime")
-            reports.output_files.append(record)
-            hashes["runtime"] = record["sha256"]
-            sizes["runtime"] = record["byte_size"]
 
         if not quarantine.empty:
-            quarantine_temp, _ = write_geoparquet_atomic(quarantine, quarantine_destination, config.row_group_size, config.overwrite, True)
-            temporary_files.append(quarantine_temp)
-            written_quarantine = gpd.read_parquet(quarantine_temp)
-            if len(written_quarantine) != len(quarantine):
-                raise ValidationError("Quarantine row count mismatch")
-            finalize_parquet(quarantine_temp, quarantine_destination)
-            temporary_files.remove(quarantine_temp)
-            output_paths["quarantine"] = quarantine_destination
-            record = file_record(quarantine_destination, county, "quarantine")
-            reports.output_files.append(record)
-            hashes["quarantine"] = record["sha256"]
-            sizes["quarantine"] = record["byte_size"]
+            quarantine_temp, _ = write_geoparquet_atomic(
+                quarantine, quarantine_destination, config.row_group_size, effective_overwrite, True
+            )
+            temp_paths["quarantine"] = quarantine_temp
+            validate_quarantine(quarantine, quarantine_temp)
 
-        parquet_path = output_paths["runtime"] or output_paths["full_fidelity"]
-        row_groups = pq.ParquetFile(parquet_path).metadata.num_row_groups if parquet_path else 0
-        metrics["row_group_count"] = row_groups
-        metrics["row_group_size_setting"] = config.row_group_size
-        metrics["covering_bbox_written"] = covering_bbox_written
-        metrics["bbox_read_validated"] = bbox_validated
-        metrics["full_fidelity_file_size"] = sizes["full_fidelity"]
-        metrics["runtime_file_size"] = sizes["runtime"]
-        metrics["quarantine_file_size"] = sizes["quarantine"]
-        metrics["compression_ratio_runtime_to_source_gdb_estimate"] = (
-            sizes["runtime"] / max(1, adapter.metadata.input_size_bytes)
-            if sizes["runtime"] is not None else None
+        # Finalize only after every planned file has been written and validated.
+        if "full_fidelity" in temp_paths:
+            finalize_parquet(temp_paths["full_fidelity"], full_destination)
+            output_paths["full_fidelity"] = full_destination
+        if "runtime" in temp_paths:
+            finalize_parquet(temp_paths["runtime"], runtime_destination)
+            output_paths["runtime"] = runtime_destination
+        if "quarantine" in temp_paths:
+            finalize_parquet(temp_paths["quarantine"], quarantine_destination)
+            output_paths["quarantine"] = quarantine_destination
+        elif effective_overwrite and quarantine_destination.exists():
+            quarantine_destination.unlink()
+
+        file_rows: dict[str, dict[str, Any]] = {}
+        if output_paths["full_fidelity"]:
+            file_rows["full_fidelity"] = file_record(
+                full_destination, config.output_dir, county, "full_fidelity", FULL_FIDELITY_SCHEMA_VERSION
+            )
+        if output_paths["runtime"]:
+            file_rows["runtime"] = file_record(
+                runtime_destination, config.output_dir, county, "runtime", RUNTIME_SCHEMA_VERSION
+            )
+        if output_paths["quarantine"]:
+            file_rows["quarantine"] = file_record(
+                quarantine_destination, config.output_dir, county, "quarantine", FULL_FIDELITY_SCHEMA_VERSION
+            )
+        reports.output_files.extend(file_rows.values())
+
+        full_size = file_rows.get("full_fidelity", {}).get("file_size_bytes")
+        runtime_size = file_rows.get("runtime", {}).get("file_size_bytes")
+        quarantine_size = file_rows.get("quarantine", {}).get("file_size_bytes")
+        runtime_reduction = (
+            int(full_size) - int(runtime_size)
+            if full_size is not None and runtime_size is not None else None
         )
+        runtime_reduction_pct = (
+            round(runtime_reduction / int(full_size) * 100, 2)
+            if runtime_reduction is not None and int(full_size) > 0 else None
+        )
+        runtime_parquet = output_paths["runtime"] or output_paths["full_fidelity"]
+        row_groups = pq.ParquetFile(runtime_parquet).metadata.num_row_groups if runtime_parquet else 0
+        metrics.update({
+            "row_group_count": row_groups,
+            "row_group_size_setting": config.row_group_size,
+            "covering_bbox_written": covering_bbox_written,
+            "bbox_read_validated": bbox_validated,
+            "full_fidelity_file_size": full_size,
+            "runtime_file_size": runtime_size,
+            "quarantine_file_size": quarantine_size,
+            "runtime_size_reduction_bytes": runtime_reduction,
+            "runtime_size_reduction_pct": runtime_reduction_pct,
+            "elapsed_processing_seconds": round(time.perf_counter() - started, 3),
+        })
         return CountyOutput(
             county=county,
             source_count=len(full),
             runtime_count=len(runtime),
             quarantine_count=len(quarantine),
-            full_fidelity_path=str(output_paths["full_fidelity"]) if output_paths["full_fidelity"] else None,
-            runtime_path=str(output_paths["runtime"]) if output_paths["runtime"] else None,
-            quarantine_path=str(output_paths["quarantine"]) if output_paths["quarantine"] else None,
-            full_fidelity_sha256=hashes["full_fidelity"],
-            runtime_sha256=hashes["runtime"],
-            quarantine_sha256=hashes["quarantine"],
-            full_fidelity_size=sizes["full_fidelity"],
-            runtime_size=sizes["runtime"],
-            quarantine_size=sizes["quarantine"],
+            full_fidelity_path=portable_relative_path(full_destination, config.output_dir) if output_paths["full_fidelity"] else None,
+            runtime_path=portable_relative_path(runtime_destination, config.output_dir) if output_paths["runtime"] else None,
+            quarantine_path=portable_relative_path(quarantine_destination, config.output_dir) if output_paths["quarantine"] else None,
+            full_fidelity_sha256=file_rows.get("full_fidelity", {}).get("sha256"),
+            runtime_sha256=file_rows.get("runtime", {}).get("sha256"),
+            quarantine_sha256=file_rows.get("quarantine", {}).get("sha256"),
+            full_fidelity_size=full_size,
+            runtime_size=runtime_size,
+            quarantine_size=quarantine_size,
             covering_bbox_written=covering_bbox_written,
             bbox_read_validated=bbox_validated,
             validation_passed=True,
@@ -1701,90 +2631,529 @@ def process_county(
             metrics=metrics,
         )
     finally:
-        for temporary in temporary_files:
+        for temporary in temp_paths.values():
             temporary.unlink(missing_ok=True)
         del source, full, runtime, quarantine
         gc.collect()
 
 
-def derive_readiness(county: str, output: CountyOutput | None, represented: bool) -> dict[str, Any]:
-    if not represented:
-        status, reason = STATUS_OVERRIDES.get(county, ("unavailable", "County is absent from source"))
-        return {
-            "spatial_readiness": False,
-            "address_readiness": False,
-            "postal_readiness": False,
-            "occupancy_classification_readiness": False,
-            "public_availability_status": status,
-            "status_reason": reason,
-        }
-    if output is None or not output.validation_passed:
-        return {
-            "spatial_readiness": False,
-            "address_readiness": False,
-            "postal_readiness": False,
-            "occupancy_classification_readiness": False,
-            "public_availability_status": "failed_validation",
-            "status_reason": "County processing or critical validation failed",
-        }
-    metrics = output.metrics
-    spatial = bool(output.runtime_path) and output.quarantine_count == 0 and output.bbox_read_validated
-    address = metrics.get("street_completeness", 0) >= 0.99 and metrics.get("nguid_completeness", 0) == 1.0
-    postal = metrics.get("zip_completeness", 0) >= 0.90 and (
-        metrics.get("postal_city_completeness", 0) >= 0.90
-        or metrics.get("municipality_locality_completeness", 0) >= 0.98
+def _coerce_report_value(value: Any) -> Any:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    text = str(value).strip()
+    if text == "":
+        return None
+    if text.lower() in {"true", "false"}:
+        return text.lower() == "true"
+    try:
+        if re.fullmatch(r"[-+]?\d+", text):
+            return int(text)
+        if re.fullmatch(r"[-+]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][-+]?\d+)?", text):
+            return float(text)
+    except ValueError:
+        pass
+    return value
+
+
+def load_existing_reports(output_dir: Path, reports: ReportStore) -> None:
+    """Load prior per-county report rows so resume preserves completed QA."""
+    reports_dir = output_dir / "reports"
+    if not reports_dir.exists():
+        return
+    filename_to_attribute = {
+        "county_summary.csv": "county_summary",
+        "field_completeness.csv": "field_completeness",
+        "classification_values.csv": "classification_values",
+        "record_role_summary.csv": "record_role_summary",
+        "occupancy_summary.csv": "occupancy_summary",
+        "parent_child_summary.csv": "parent_child_summary",
+        "date_anomalies.csv": "date_anomalies",
+        "coordinate_anomalies.csv": "coordinate_anomalies",
+        "duplicate_address_summary.csv": "duplicate_address_summary",
+        "postal_fallback_summary.csv": "postal_fallback_summary",
+        "quarantine_summary.csv": "quarantine_summary",
+        "classification_conflicts.csv": "classification_conflicts",
+        "output_files.csv": "output_files",
+    }
+    for filename, attribute in filename_to_attribute.items():
+        report_path = reports_dir / filename
+        if not report_path.exists():
+            continue
+        try:
+            frame = pd.read_csv(report_path, dtype=object)
+        except pd.errors.EmptyDataError:
+            continue
+        rows = [
+            {key: _coerce_report_value(value) for key, value in row.items()}
+            for row in frame.to_dict("records")
+        ]
+        getattr(reports, attribute).extend(rows)
+
+
+def remove_county_report_rows(reports: ReportStore, county: str) -> None:
+    for attribute in (
+        "county_summary", "field_completeness", "classification_values",
+        "record_role_summary", "occupancy_summary", "parent_child_summary",
+        "date_anomalies", "coordinate_anomalies", "duplicate_address_summary",
+        "postal_fallback_summary", "quarantine_summary",
+        "classification_conflicts", "output_files",
+    ):
+        rows = getattr(reports, attribute)
+        setattr(reports, attribute, [row for row in rows if row.get("county") != county])
+
+
+def load_existing_manifest(output_dir: Path) -> dict[str, dict[str, Any]]:
+    path = output_dir / "manifest" / "coverage_manifest.json"
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    rows = payload.get("counties", []) if isinstance(payload, dict) else payload
+    return {str(row.get("canonical_county")): row for row in rows if row.get("canonical_county")}
+
+
+def existing_summary_metrics(reports: ReportStore, county: str) -> dict[str, Any]:
+    for row in reports.county_summary:
+        if row.get("county") == county:
+            return {
+                "source_record_count": int(row.get("processed_source_count") or 0),
+                "runtime_record_count": int(row.get("runtime_count") or 0),
+                "quarantine_record_count": int(row.get("quarantine_count") or 0),
+                "reconciliation_passed": bool(row.get("reconciliation_passed")),
+                "runtime_column_count": int(row.get("runtime_column_count") or len(RUNTIME_COLUMNS)),
+                "full_fidelity_column_count": int(row.get("full_fidelity_column_count") or 0),
+                "runtime_file_size": row.get("runtime_file_size_bytes"),
+                "full_fidelity_file_size": row.get("full_fidelity_file_size_bytes"),
+                "runtime_size_reduction_bytes": row.get("runtime_size_reduction_bytes"),
+                "runtime_size_reduction_pct": row.get("runtime_size_reduction_pct"),
+                "geometry_completeness": float(row.get("geometry_completeness") or 0),
+                "nguid_completeness": float(row.get("nguid_completeness") or 0),
+                "missing_nguid_count": int(row.get("missing_nguid_count") or 0),
+                "duplicate_nguid_record_count": int(row.get("duplicate_nguid_record_count") or 0),
+                "duplicate_source_record_id_count": int(row.get("duplicate_source_record_id_count") or 0),
+                "street_completeness": float(row.get("street_completeness") or 0),
+                "postal_city_completeness": float(row.get("postal_city_completeness") or 0),
+                "zip_completeness": float(row.get("zip_completeness") or 0),
+                "municipality_locality_completeness": float(row.get("municipality_locality_completeness") or 0),
+                "parent_building_count": int(row.get("parent_count") or 0),
+                "potential_child_count": int(row.get("child_count") or 0),
+                "unknown_unit_count": int(row.get("unknown_unit_count") or 0),
+                "unknown_classification_count": int(row.get("unknown_unit_count") or 0),
+                "warning_count": int(row.get("warning_count") or 0),
+                "technical_warning_count": int(row.get("technical_warning_count") or 0),
+                "classification_conflict_count": int(
+                    row.get("classification_conflict_count") or 0
+                ),
+                "subaddress_with_parcel_or_site_count": int(
+                    row.get("subaddress_with_parcel_or_site_count") or 0
+                ),
+                "subaddress_with_utility_or_infrastructure_count": int(
+                    row.get("subaddress_with_utility_or_infrastructure_count") or 0
+                ),
+                "subaddress_with_access_or_non_mailable_count": int(
+                    row.get("subaddress_with_access_or_non_mailable_count") or 0
+                ),
+                "row_group_count": int(row.get("row_group_count") or 0),
+                "covering_bbox_written": bool(row.get("covering_bbox_written")),
+                "bbox_read_validated": bool(row.get("bbox_read_validated")),
+                "elapsed_processing_seconds": float(row.get("elapsed_processing_seconds") or 0),
+                "latest_plausible_dateupdate": row.get("latest_plausible_source_update_date"),
+            }
+    return {}
+
+
+def validate_existing_county_output(
+    county: str,
+    config: PipelineConfig,
+    metadata: SourceMetadata,
+    expected_inventory_count: int,
+    reports: ReportStore,
+    existing_manifest: Mapping[str, Mapping[str, Any]],
+) -> CountyOutput:
+    """Validate existing files before resume skips or validate-only accepts them."""
+    manifest_row = dict(existing_manifest.get(county, {}))
+    full_relative = manifest_row.get("full_fidelity_relative_path") or f"full_fidelity/{county_slug(county)}.parquet"
+    runtime_relative = manifest_row.get("runtime_relative_path") or f"runtime/{county_slug(county)}.parquet"
+    quarantine_relative = manifest_row.get("quarantine_relative_path") or f"quarantine/{county_slug(county)}.parquet"
+    full_path = config.output_dir / str(full_relative)
+    runtime_path = config.output_dir / str(runtime_relative)
+    quarantine_path = config.output_dir / str(quarantine_relative)
+
+    if not config.runtime_only and not full_path.exists():
+        raise ValidationError(f"Existing full-fidelity file is missing: {full_relative}")
+    if not config.full_fidelity_only and not runtime_path.exists():
+        raise ValidationError(f"Existing runtime file is missing: {runtime_relative}")
+
+    full_count = pq.ParquetFile(full_path).metadata.num_rows if full_path.exists() else expected_inventory_count
+    runtime_count = pq.ParquetFile(runtime_path).metadata.num_rows if runtime_path.exists() else 0
+    quarantine_count = pq.ParquetFile(quarantine_path).metadata.num_rows if quarantine_path.exists() else 0
+    if full_path.exists() and full_count != expected_inventory_count:
+        raise ValidationError(f"Existing full-fidelity count {full_count:,} does not match inventory {expected_inventory_count:,}")
+    if runtime_path.exists() and runtime_count + quarantine_count != expected_inventory_count:
+        raise ValidationError(
+            f"Existing reconciliation failed: {runtime_count:,} runtime + {quarantine_count:,} quarantine != {expected_inventory_count:,} inventory"
+        )
+
+    covering_bbox_written = bool(manifest_row.get("covering_bbox_written"))
+    bbox_validated = False
+    if runtime_path.exists():
+        validate_runtime_arrow_schema(runtime_path)
+        runtime = gpd.read_parquet(runtime_path)
+        validate_geometry_frame(runtime, "Existing runtime output", require_wisconsin=True)
+        record_ids = clean_series(runtime, "Source_Record_ID")
+        if record_ids.eq("").any() or not record_ids.is_unique:
+            raise ValidationError("Existing runtime Source_Record_ID is blank or non-unique")
+        if runtime["Canonical_Critical_Failure_Flag"].fillna(False).astype(bool).any():
+            raise ValidationError("Existing runtime contains critical-failure rows")
+        if covering_bbox_written and len(runtime):
+            sample = runtime.geometry.iloc[len(runtime) // 2]
+            epsilon = 0.005
+            bbox = (sample.x - epsilon, sample.y - epsilon, sample.x + epsilon, sample.y + epsilon)
+            expected = int(runtime.geometry.covered_by(box(*bbox)).sum())
+            actual = len(gpd.read_parquet(runtime_path, bbox=bbox))
+            if expected != actual:
+                raise ValidationError("Existing runtime bounding-box read failed validation")
+            bbox_validated = True
+        elif covering_bbox_written:
+            bbox_validated = True
+        del runtime
+    if full_path.exists():
+        full_schema = pq.ParquetFile(full_path).schema_arrow.names
+        missing = [field for field in metadata.source_fields if field not in full_schema]
+        if missing:
+            raise ValidationError("Existing full-fidelity file is missing source fields: " + ", ".join(missing[:20]))
+        full_identity = gpd.read_parquet(full_path, columns=["Source_Record_ID", "geometry"])
+        if full_identity.crs is None or full_identity.crs.to_epsg() != 4326:
+            raise ValidationError("Existing full-fidelity CRS is not EPSG:4326")
+        ids = clean_series(full_identity, "Source_Record_ID")
+        if ids.eq("").any() or not ids.is_unique:
+            raise ValidationError("Existing full-fidelity Source_Record_ID is blank or non-unique")
+        del full_identity
+    if quarantine_path.exists():
+        quarantine = gpd.read_parquet(quarantine_path)
+        if not quarantine["Canonical_Critical_Failure_Flag"].fillna(False).astype(bool).all():
+            raise ValidationError("Existing quarantine includes a non-critical row")
+        del quarantine
+
+    expected_hashes = {
+        "full_fidelity": manifest_row.get("full_fidelity_sha256"),
+        "runtime": manifest_row.get("runtime_sha256"),
+        "quarantine": manifest_row.get("quarantine_sha256"),
+    }
+    actual_hashes = {
+        "full_fidelity": sha256_file(full_path) if full_path.exists() else None,
+        "runtime": sha256_file(runtime_path) if runtime_path.exists() else None,
+        "quarantine": sha256_file(quarantine_path) if quarantine_path.exists() else None,
+    }
+    for output_type, expected_hash in expected_hashes.items():
+        if expected_hash and actual_hashes[output_type] != expected_hash:
+            raise ValidationError(f"Existing {output_type} SHA-256 does not match the manifest")
+
+    metrics = existing_summary_metrics(reports, county)
+    metrics.setdefault("source_record_count", expected_inventory_count)
+    metrics.setdefault("runtime_record_count", runtime_count)
+    metrics.setdefault("quarantine_record_count", quarantine_count)
+    metrics.setdefault("reconciliation_passed", runtime_count + quarantine_count == expected_inventory_count)
+    metrics.setdefault("runtime_column_count", len(RUNTIME_COLUMNS) if runtime_path.exists() else 0)
+    metrics.setdefault("full_fidelity_column_count", len(pq.ParquetFile(full_path).schema_arrow.names) if full_path.exists() else 0)
+    metrics.setdefault("runtime_file_size", runtime_path.stat().st_size if runtime_path.exists() else None)
+    metrics.setdefault("full_fidelity_file_size", full_path.stat().st_size if full_path.exists() else None)
+    metrics.setdefault("quarantine_file_size", quarantine_path.stat().st_size if quarantine_path.exists() else None)
+    metrics["covering_bbox_written"] = covering_bbox_written
+    metrics["bbox_read_validated"] = bbox_validated
+    metrics["row_group_count"] = pq.ParquetFile(runtime_path if runtime_path.exists() else full_path).metadata.num_row_groups
+    return CountyOutput(
+        county=county,
+        source_count=expected_inventory_count,
+        runtime_count=runtime_count,
+        quarantine_count=quarantine_count,
+        full_fidelity_path=portable_relative_path(full_path, config.output_dir) if full_path.exists() else None,
+        runtime_path=portable_relative_path(runtime_path, config.output_dir) if runtime_path.exists() else None,
+        quarantine_path=portable_relative_path(quarantine_path, config.output_dir) if quarantine_path.exists() else None,
+        full_fidelity_sha256=actual_hashes["full_fidelity"],
+        runtime_sha256=actual_hashes["runtime"],
+        quarantine_sha256=actual_hashes["quarantine"],
+        full_fidelity_size=full_path.stat().st_size if full_path.exists() else None,
+        runtime_size=runtime_path.stat().st_size if runtime_path.exists() else None,
+        quarantine_size=quarantine_path.stat().st_size if quarantine_path.exists() else None,
+        covering_bbox_written=covering_bbox_written,
+        bbox_read_validated=bbox_validated,
+        validation_passed=True,
+        validation_messages=["Existing county outputs passed resume/validate-only structural, hash, schema, identity, geometry, and reconciliation checks"],
+        metrics=metrics,
+        skipped_by_resume=True,
     )
-    occupancy = metrics.get("unknown_classification_count", 0) / max(1, output.source_count) <= 0.20
-    override = STATUS_OVERRIDES.get(county)
-    if not output.runtime_path:
-        status, reason = "needs_validation", "Full-fidelity output exists, but no runtime file was generated for publication"
-    elif override:
-        status, reason = override
+
+
+def derive_readiness(
+    county: str,
+    output: CountyOutput | None,
+    represented: bool,
+    requested: bool,
+    failed: bool,
+) -> dict[str, Any]:
+    """Separate current-run execution state from durable county readiness."""
+    override = COUNTY_STATUS_OVERRIDES.get(county)
+
+    if not represented:
+        return {
+            "technical_validation_status": "not_present_in_source",
+            "coverage_readiness_status": "not_present_in_source",
+            "production_source_status": (
+                str(override["production_source_status"])
+                if override else "unavailable"
+            ),
+            "public_availability_status": (
+                str(override["public_availability_status"])
+                if override else "not_present_in_source"
+            ),
+            "status_reason": (
+                str(override["reason"])
+                if override
+                else "County is absent from the statewide source snapshot."
+            ),
+            "run_processing_status": "not_present_in_source",
+            "run_processing_reason": (
+                "County could not be processed because it is absent from the "
+                "statewide source snapshot."
+            ),
+            "recommended_source": (
+                override.get("recommended_source") if override else None
+            ),
+            "spatial_readiness": False,
+            "address_readiness": False,
+            "postal_readiness": False,
+            "occupancy_classification_readiness": False,
+        }
+
+    if not requested:
+        if override:
+            coverage_status = str(override["coverage_readiness_status"])
+            production_status = str(override["production_source_status"])
+            public_status = str(override["public_availability_status"])
+            durable_reason = str(override["reason"])
+            recommended_source = override.get("recommended_source")
+        else:
+            coverage_status = "needs_validation"
+            production_status = "not_processed"
+            public_status = "needs_validation"
+            durable_reason = (
+                "Represented in the statewide source but not independently "
+                "validated."
+            )
+            recommended_source = None
+        return {
+            "technical_validation_status": "not_processed",
+            "coverage_readiness_status": coverage_status,
+            "production_source_status": production_status,
+            "public_availability_status": public_status,
+            "status_reason": durable_reason,
+            "run_processing_status": "not_processed",
+            "run_processing_reason": (
+                "County was represented in the source but was not selected in "
+                "this run."
+            ),
+            "recommended_source": recommended_source,
+            "spatial_readiness": False,
+            "address_readiness": False,
+            "postal_readiness": False,
+            "occupancy_classification_readiness": False,
+        }
+
+    if failed or output is None or not output.validation_passed:
+        return {
+            "technical_validation_status": "failed_validation",
+            "coverage_readiness_status": (
+                str(override["coverage_readiness_status"])
+                if override else "needs_validation"
+            ),
+            "production_source_status": (
+                str(override["production_source_status"])
+                if override else "unavailable"
+            ),
+            "public_availability_status": (
+                str(override["public_availability_status"])
+                if override else "failed_validation"
+            ),
+            "status_reason": (
+                str(override["reason"])
+                if override
+                else "County coverage has not been independently validated."
+            ),
+            "run_processing_status": "failed_validation",
+            "run_processing_reason": (
+                "County processing or critical validation failed in this run."
+            ),
+            "recommended_source": (
+                override.get("recommended_source") if override else None
+            ),
+            "spatial_readiness": False,
+            "address_readiness": False,
+            "postal_readiness": False,
+            "occupancy_classification_readiness": False,
+        }
+
+    metrics = output.metrics
+    technical_warning_count = int(
+        metrics.get("technical_warning_count") or 0
+    )
+    technical_status = (
+        "validated_with_warnings"
+        if technical_warning_count
+        else "validated"
+    )
+    spatial = (
+        bool(output.runtime_path)
+        and output.bbox_read_validated
+        and output.quarantine_count == 0
+    )
+    address = (
+        float(metrics.get("street_completeness") or 0) >= 0.99
+        and bool(metrics.get("source_record_id_unique", True))
+    )
+    postal = (
+        float(metrics.get("zip_completeness") or 0) >= 0.90
+        and (
+            float(metrics.get("postal_city_completeness") or 0) >= 0.90
+            or float(
+                metrics.get("municipality_locality_completeness") or 0
+            ) >= 0.98
+        )
+    )
+    unknown_ratio = (
+        int(
+            metrics.get("unknown_unit_count")
+            or metrics.get("unknown_classification_count")
+            or 0
+        )
+        / max(1, output.source_count)
+    )
+    occupancy = unknown_ratio <= 0.20
+
+    if override:
+        coverage_status = str(override["coverage_readiness_status"])
+        production_status = str(override["production_source_status"])
+        public_status = str(override["public_availability_status"])
+        reason = str(override["reason"])
+        recommended_source = override.get("recommended_source")
+    elif not output.runtime_path:
+        coverage_status = "needs_validation"
+        production_status = "not_ready"
+        public_status = "needs_validation"
+        reason = (
+            "Full-fidelity output validated, but no runtime file was generated "
+            "for production."
+        )
+        recommended_source = None
     else:
-        status, reason = "needs_validation", "Files passed technical validation but county completeness has not been independently verified"
+        coverage_status = "needs_validation"
+        production_status = "statewide_runtime_candidate"
+        public_status = "needs_validation"
+        reason = (
+            "Technical validation passed; countywide coverage still requires "
+            "independent approval."
+        )
+        recommended_source = (
+            "Wisconsin statewide NG911 runtime after approval"
+        )
+
     return {
+        "technical_validation_status": technical_status,
+        "coverage_readiness_status": coverage_status,
+        "production_source_status": production_status,
+        "public_availability_status": public_status,
+        "status_reason": reason,
+        "run_processing_status": (
+            "skipped_by_resume"
+            if output.skipped_by_resume
+            else "processed_successfully"
+        ),
+        "run_processing_reason": (
+            "Existing county outputs passed validation and were skipped by "
+            "resume."
+            if output.skipped_by_resume
+            else "County was processed and validated successfully in this run."
+        ),
+        "recommended_source": recommended_source,
         "spatial_readiness": spatial,
         "address_readiness": address,
         "postal_readiness": postal,
         "occupancy_classification_readiness": occupancy,
-        "public_availability_status": status,
-        "status_reason": reason,
     }
-
 
 def build_manifest(
     metadata: SourceMetadata,
     config: PipelineConfig,
     county_variants: Mapping[str, Sequence[str]],
+    inventory_counts: Mapping[str, int],
     outcomes: Mapping[str, CountyOutput],
+    failed_counties: set[str],
+    requested_counties: Sequence[str],
 ) -> list[dict[str, Any]]:
+    requested_set = set(requested_counties)
     rows: list[dict[str, Any]] = []
     for county in WI_COUNTIES:
         represented = bool(county_variants.get(county))
         output = outcomes.get(county)
-        readiness = derive_readiness(county, output, represented)
+        requested = county in requested_set
+        readiness = derive_readiness(county, output, represented, requested, county in failed_counties)
         row: dict[str, Any] = {
             "canonical_county": county,
+            "county_key": county_slug(county),
             "source_system": SOURCE_SYSTEM,
             "source_version": metadata.source_timestamp[:10] if metadata.source_timestamp else config.as_of_date.isoformat(),
             "source_hash": metadata.source_sha256,
-            "source_record_count": output.source_count if output else 0,
-            "runtime_record_count": output.runtime_count if output else 0,
-            "quarantine_record_count": output.quarantine_count if output else 0,
-            "validation_date": date.today().isoformat(),
+            "statewide_inventory_count": int(inventory_counts.get(county, 0)),
+            "processed_source_count": output.source_count if output else 0,
+            "runtime_count": output.runtime_count if output else 0,
+            "quarantine_count": output.quarantine_count if output else 0,
+            "requested_in_run": requested,
+            "processed_in_run": output is not None,
+            "skipped_by_resume": output.skipped_by_resume if output else False,
             **readiness,
-            "county_override_status": readiness["public_availability_status"] == "county_override",
-            "runtime_filename": Path(output.runtime_path).name if output and output.runtime_path else None,
+            "validation_date": date.today().isoformat() if output else None,
+            "runtime_relative_path": output.runtime_path if output else None,
             "runtime_byte_size": output.runtime_size if output else None,
             "runtime_sha256": output.runtime_sha256 if output else None,
-            "full_fidelity_filename": Path(output.full_fidelity_path).name if output and output.full_fidelity_path else None,
+            "full_fidelity_relative_path": output.full_fidelity_path if output else None,
+            "full_fidelity_byte_size": output.full_fidelity_size if output else None,
             "full_fidelity_sha256": output.full_fidelity_sha256 if output else None,
-            "placeholder_r2_url": None,
+            "quarantine_relative_path": output.quarantine_path if output else None,
+            "quarantine_byte_size": output.quarantine_size if output else None,
+            "quarantine_sha256": output.quarantine_sha256 if output else None,
             "latest_plausible_source_update_date": output.metrics.get("latest_plausible_dateupdate") if output else None,
             "quality_score_summary": quality_score(output.metrics) if output else None,
+            "classification_conflict_count": (
+                int(output.metrics.get("classification_conflict_count") or 0)
+                if output else 0
+            ),
+            "subaddress_with_parcel_or_site_count": (
+                int(output.metrics.get("subaddress_with_parcel_or_site_count") or 0)
+                if output else 0
+            ),
+            "subaddress_with_utility_or_infrastructure_count": (
+                int(
+                    output.metrics.get(
+                        "subaddress_with_utility_or_infrastructure_count"
+                    ) or 0
+                )
+                if output else 0
+            ),
+            "subaddress_with_access_or_non_mailable_count": (
+                int(
+                    output.metrics.get(
+                        "subaddress_with_access_or_non_mailable_count"
+                    ) or 0
+                )
+                if output else 0
+            ),
             "covering_bbox_written": output.covering_bbox_written if output else False,
             "bbox_read_validated": output.bbox_read_validated if output else False,
             "validation_passed": output.validation_passed if output else False,
+            "pipeline_version": PIPELINE_VERSION,
+            "runtime_schema_version": RUNTIME_SCHEMA_VERSION,
+            "full_fidelity_schema_version": FULL_FIDELITY_SCHEMA_VERSION,
+            "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
+            "classification_rule_version": CLASSIFICATION_RULE_VERSION,
         }
         rows.append(row)
     return rows
@@ -1812,8 +3181,8 @@ def compare_previous_manifest(current: list[dict[str, Any]], previous_path: Path
         old = previous_lookup.get(row["canonical_county"])
         if not old:
             continue
-        for field_name in ("source_record_count", "runtime_record_count", "quarantine_record_count"):
-            old_value = int(old.get(field_name) or 0)
+        for field_name in ("statewide_inventory_count", "runtime_count", "quarantine_count"):
+            old_value = int(old.get(field_name) or old.get("source_record_count") or 0)
             new_value = int(row.get(field_name) or 0)
             if old_value and abs(new_value - old_value) / old_value > 0.10:
                 warnings.append({
@@ -1832,9 +3201,22 @@ def compare_previous_manifest(current: list[dict[str, Any]], previous_path: Path
                 "field": "latest_plausible_source_update_date",
                 "previous": old_date,
                 "current": new_date,
+                "change_pct": None,
                 "warning": "Current source appears older than previous release",
             })
     return warnings
+
+
+def validate_portable_manifest_rows(rows: Sequence[Mapping[str, Any]]) -> None:
+    path_fields = ("runtime_relative_path", "full_fidelity_relative_path", "quarantine_relative_path")
+    for row in rows:
+        for field_name in path_fields:
+            value = row.get(field_name)
+            if not value:
+                continue
+            text = str(value)
+            if Path(text).is_absolute() or re.match(r"^[A-Za-z]:", text) or "/workspaces/" in text.lower():
+                raise ValidationError(f"Manifest contains a nonportable path in {field_name}: {text}")
 
 
 def write_reports(
@@ -1845,9 +3227,14 @@ def write_reports(
     manifest_rows: list[dict[str, Any]],
     outcomes: Mapping[str, CountyOutput],
     previous_warnings: list[dict[str, Any]],
+    inventory_counts: Mapping[str, int],
+    requested_counties: Sequence[str],
+    run_started_utc: str,
+    run_ended_utc: str,
+    elapsed_seconds: float,
 ) -> None:
     reports_dir = ensure_directory(output_dir / "reports")
-    report_map = {
+    report_map: dict[str, Sequence[Mapping[str, Any]]] = {
         "county_summary.csv": reports.county_summary,
         "county_name_variants.csv": reports.county_name_variants,
         "field_completeness.csv": reports.field_completeness,
@@ -1861,72 +3248,215 @@ def write_reports(
         "duplicate_nguid_report.csv": reports.duplicate_nguid_report,
         "postal_fallback_summary.csv": reports.postal_fallback_summary,
         "quarantine_summary.csv": reports.quarantine_summary,
+        "classification_conflicts.csv": reports.classification_conflicts,
         "output_files.csv": reports.output_files,
         "previous_release_warnings.csv": previous_warnings,
         "failures.csv": reports.failures,
     }
     for filename, rows in report_map.items():
-        atomic_write_csv(reports_dir / filename, rows)
+        atomic_write_csv(reports_dir / filename, rows, REPORT_SCHEMAS[filename])
+
+    failed_counties = sorted({str(row.get("county")) for row in reports.failures if row.get("county")})
+    successful_counties = sorted(county for county, output in outcomes.items() if output.validation_passed)
+    skipped_counties = sorted(county for county, output in outcomes.items() if output.skipped_by_resume)
+    available_counties = [county for county in WI_COUNTIES if inventory_counts.get(county, 0)]
+    not_processed = [county for county in available_counties if county not in set(requested_counties)]
     run_summary = {
-        "processing_timestamp_utc": utc_now_iso(),
-        "source": asdict(metadata),
+        "pipeline_version": PIPELINE_VERSION,
+        "runtime_schema_version": RUNTIME_SCHEMA_VERSION,
+        "full_fidelity_schema_version": FULL_FIDELITY_SCHEMA_VERSION,
+        "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
+        "classification_rule_version": CLASSIFICATION_RULE_VERSION,
+        "source_zip_filename": config.input_path.name,
+        "source_layer": metadata.layer_name,
+        "source_sha256": metadata.source_sha256,
+        "source_as_of_date": metadata.source_timestamp[:10] if metadata.source_timestamp else config.as_of_date.isoformat(),
         "as_of_date": config.as_of_date.isoformat(),
         "as_of_date_source": config.as_of_date_source,
-        "requested_counties": config.counties,
-        "processed_counties": list(outcomes),
-        "successful_counties": [county for county, output in outcomes.items() if output.validation_passed],
+        "run_scope": "statewide" if config.counties is None else "selective",
+        "run_started_utc": run_started_utc,
+        "run_ended_utc": run_ended_utc,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "all_counties_available_in_source": available_counties,
+        "requested_counties": list(requested_counties),
+        "successful_counties": successful_counties,
+        "failed_counties": failed_counties,
+        "skipped_counties": skipped_counties,
+        "not_processed_counties": not_processed,
+        "total_source_records_processed": sum(output.source_count for output in outcomes.values()),
+        "total_runtime_records": sum(output.runtime_count for output in outcomes.values()),
+        "total_quarantined_records": sum(output.quarantine_count for output in outcomes.values()),
+        "total_classification_conflicts": sum(
+            int(output.metrics.get("classification_conflict_count") or 0)
+            for output in outcomes.values()
+        ),
+        "total_subaddress_with_parcel_or_site": sum(
+            int(
+                output.metrics.get(
+                    "subaddress_with_parcel_or_site_count"
+                ) or 0
+            )
+            for output in outcomes.values()
+        ),
+        "total_subaddress_with_utility_or_infrastructure": sum(
+            int(
+                output.metrics.get(
+                    "subaddress_with_utility_or_infrastructure_count"
+                ) or 0
+            )
+            for output in outcomes.values()
+        ),
+        "total_subaddress_with_access_or_non_mailable": sum(
+            int(
+                output.metrics.get(
+                    "subaddress_with_access_or_non_mailable_count"
+                ) or 0
+            )
+            for output in outcomes.values()
+        ),
+        "selective_or_statewide_run": "statewide" if config.counties is None else "selective",
+        "resume_mode": config.resume,
+        "validate_only_mode": config.validate_only,
         "failures": reports.failures,
         "non_destructive_policy": {
             "address_deduplication": False,
             "coordinate_deduplication": False,
             "parent_record_deletion": False,
-            "global_place_type_exclusion": False,
+            "generic_unit_assumed_apartment": False,
             "source_lat_long_used_for_geometry": False,
         },
     }
     atomic_write_json(reports_dir / "run_summary.json", run_summary)
+
+    validate_portable_manifest_rows(manifest_rows)
     manifest_dir = ensure_directory(output_dir / "manifest")
-    atomic_write_json(manifest_dir / "coverage_manifest.json", {
-        "generated_at_utc": utc_now_iso(),
+    manifest_payload = {
+        "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
+        "pipeline_version": PIPELINE_VERSION,
+        "runtime_schema_version": RUNTIME_SCHEMA_VERSION,
+        "full_fidelity_schema_version": FULL_FIDELITY_SCHEMA_VERSION,
+        "classification_rule_version": CLASSIFICATION_RULE_VERSION,
+        "generated_at_utc": run_ended_utc,
+        "run_scope": run_summary["run_scope"],
+        "run_started_utc": run_started_utc,
+        "run_ended_utc": run_ended_utc,
+        "elapsed_seconds": round(elapsed_seconds, 3),
         "source_hash": metadata.source_sha256,
         "source_version": metadata.source_timestamp[:10] if metadata.source_timestamp else config.as_of_date.isoformat(),
+        "all_counties_available_in_source": available_counties,
+        "counties_requested": list(requested_counties),
+        "counties_processed_successfully": successful_counties,
+        "counties_failed": failed_counties,
+        "counties_skipped": skipped_counties,
+        "counties_not_processed": not_processed,
         "counties": manifest_rows,
-    })
-    atomic_write_csv(manifest_dir / "coverage_manifest.csv", manifest_rows)
+    }
+    atomic_write_json(manifest_dir / "coverage_manifest.json", manifest_payload)
+    atomic_write_csv(manifest_dir / "coverage_manifest.csv", manifest_rows, MANIFEST_COLUMNS)
 
     compatibility_notes = {
+        "runtime_schema_version": RUNTIME_SCHEMA_VERSION,
+        "classification_rule_version": CLASSIFICATION_RULE_VERSION,
         "current_analyzer_compatible_columns_included": list(CURRENT_ANALYZER_COLUMNS),
+        "runtime_field_count": len(RUNTIME_COLUMNS),
         "targeted_analyzer_changes_still_recommended": [
             "Load county GeoParquet using gpd.read_parquet(..., bbox=...) rather than gpd.read_file.",
-            "Prefer Canonical_Full_House_Number over recombining Canonical_HouseNo and Canonical_HouseSx.",
-            "Prefer Canonical_Full_Street so St_PreTyp, St_PreMod, St_PreSep, and St_PosMod are not lost.",
-            "Prefer Canonical_Subaddress and do not prefix every untyped unit with Apt.",
-            "Use Canonical_ZIP4 rather than deriving ZIP4 only from Canonical_Zip_Code.",
-            "Use Canonical_Record_Role, Potential_Parent_Record, and occupancy flags to prevent parent-building double counting.",
-            "Use Canonical_Apartment_Candidate_Flag rather than grouping every repeated nonblank unit as an apartment.",
-            "Use Canonical_Eligibility_Status and Canonical_Quality_Flags in the Excluded Audit instead of preprocessing questionable rows away.",
-            "Keep Milwaukee on a county-specific adapter until the City of Milwaukee statewide coverage gap is resolved.",
+            "Prefer Canonical_Full_House_Number and Canonical_Full_Street rather than rebuilding simplified addresses.",
+            "Use Canonical_Subaddress; do not prefix every untyped unit with Apt.",
+            "Use Canonical_ZIP4 and Canonical_Postal_City distinctly from municipality.",
+            "Use Canonical_Analyzer_Handling, Canonical_Exclusion_Category, and Canonical_Analyzer_Eligible for operational filtering.",
+            "Use Potential_Parent_Record, Potential_Child_Record, and Potential_Double_Count_Flag to avoid parent-building double counting.",
+            "Use Canonical_Occupancy_Category and Canonical_Occupancy_Reason rather than treating every repeated unit as an apartment.",
+            "Keep Milwaukee on the county-specific source until the statewide City of Milwaukee coverage gap is resolved.",
         ],
     }
     atomic_write_json(output_dir / "source_metadata" / "analyzer_compatibility_notes.json", compatibility_notes)
 
 
-def add_county_summary_row(reports: ReportStore, output: CountyOutput) -> None:
+def add_county_summary_row(
+    reports: ReportStore,
+    output: CountyOutput,
+    statewide_inventory_count: int,
+) -> None:
     metrics = output.metrics
+    readiness = derive_readiness(output.county, output, True, True, False)
     row = {
         "county": output.county,
-        **metrics,
+        "county_key": county_slug(output.county),
+        "statewide_inventory_count": statewide_inventory_count,
+        "processed_source_count": output.source_count,
+        "runtime_count": output.runtime_count,
+        "quarantine_count": output.quarantine_count,
+        "reconciliation_passed": output.source_count == output.runtime_count + output.quarantine_count,
+        "runtime_column_count": metrics.get("runtime_column_count", len(RUNTIME_COLUMNS)),
+        "full_fidelity_column_count": metrics.get("full_fidelity_column_count"),
+        "runtime_file_size_bytes": output.runtime_size,
+        "full_fidelity_file_size_bytes": output.full_fidelity_size,
+        "runtime_size_reduction_bytes": metrics.get("runtime_size_reduction_bytes"),
+        "runtime_size_reduction_pct": metrics.get("runtime_size_reduction_pct"),
+        "geometry_completeness": metrics.get("geometry_completeness"),
+        "nguid_completeness": metrics.get("nguid_completeness"),
+        "missing_nguid_count": metrics.get("missing_nguid_count"),
+        "duplicate_nguid_record_count": metrics.get("duplicate_nguid_record_count"),
+        "duplicate_source_record_id_count": metrics.get("duplicate_source_record_id_count"),
+        "street_completeness": metrics.get("street_completeness"),
+        "postal_city_completeness": metrics.get("postal_city_completeness"),
+        "zip_completeness": metrics.get("zip_completeness"),
+        "municipality_locality_completeness": metrics.get("municipality_locality_completeness"),
+        "parent_count": metrics.get("parent_building_count"),
+        "child_count": metrics.get("potential_child_count"),
+        "unknown_unit_count": metrics.get("unknown_unit_count"),
+        "warning_count": metrics.get("warning_count"),
+        "technical_warning_count": metrics.get("technical_warning_count"),
+        "classification_conflict_count": metrics.get(
+            "classification_conflict_count"
+        ),
+        "subaddress_with_parcel_or_site_count": metrics.get(
+            "subaddress_with_parcel_or_site_count"
+        ),
+        "subaddress_with_utility_or_infrastructure_count": metrics.get(
+            "subaddress_with_utility_or_infrastructure_count"
+        ),
+        "subaddress_with_access_or_non_mailable_count": metrics.get(
+            "subaddress_with_access_or_non_mailable_count"
+        ),
+        "row_group_count": metrics.get("row_group_count"),
+        "covering_bbox_written": output.covering_bbox_written,
+        "bbox_read_validated": output.bbox_read_validated,
+        "validation_status": readiness["technical_validation_status"],
+        "coverage_readiness_status": readiness["coverage_readiness_status"],
+        "production_source_status": readiness["production_source_status"],
+        "readiness_reason": readiness["status_reason"],
+        "elapsed_processing_seconds": metrics.get("elapsed_processing_seconds"),
+        "latest_plausible_source_update_date": metrics.get("latest_plausible_dateupdate"),
         "full_fidelity_sha256": output.full_fidelity_sha256,
         "runtime_sha256": output.runtime_sha256,
         "quarantine_sha256": output.quarantine_sha256,
-        "validation_passed": output.validation_passed,
         "validation_messages": " | ".join(output.validation_messages),
     }
     reports.county_summary.append(row)
 
 
+def record_failure(
+    reports: ReportStore,
+    county: str,
+    stage: str,
+    exc: Exception,
+) -> None:
+    traceback_text = traceback.format_exc()
+    reports.failures.append({
+        "county": county,
+        "processing_stage": stage,
+        "exception_type": type(exc).__name__,
+        "exception_message": str(exc),
+        "timestamp_utc": utc_now_iso(),
+        "traceback_reference": traceback_text[-4_000:],
+    })
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    run_started_utc = utc_now_iso()
+    run_started_perf = time.perf_counter()
     try:
         require_dependencies()
         input_path = args.input.expanduser().resolve()
@@ -1944,6 +3474,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             as_of_date_source=as_of_source,
             counties=requested_counties,
             overwrite=args.overwrite,
+            resume=args.resume,
+            validate_only=args.validate_only,
+            schema_report=args.schema_report,
             runtime_only=args.runtime_only,
             full_fidelity_only=args.full_fidelity_only,
             keep_extracted_gdb=args.keep_extracted_gdb,
@@ -1951,52 +3484,179 @@ def main(argv: Sequence[str] | None = None) -> int:
             previous_manifest=args.previous_manifest.expanduser().resolve() if args.previous_manifest else None,
             fail_fast=args.fail_fast,
         )
-        LOGGER.info("Starting Wisconsin NG911 pipeline")
+        LOGGER.info(
+            "Starting Wisconsin NG911 pipeline v%s (runtime schema %s)",
+            PIPELINE_VERSION,
+            RUNTIME_SCHEMA_VERSION,
+        )
         LOGGER.info("As-of date: %s (%s)", config.as_of_date, config.as_of_date_source)
-        gdb_path, temporary_owner, input_kind = extract_or_locate_gdb(input_path, output_dir, config.keep_extracted_gdb)
+        gdb_path, temporary_owner, input_kind = extract_or_locate_gdb(
+            input_path, output_dir, config.keep_extracted_gdb
+        )
         try:
             metadata = inspect_source(input_path, gdb_path, input_kind)
             write_source_metadata(output_dir, metadata)
-            LOGGER.info("Source layer %s: %s Point records, CRS %s", metadata.layer_name, f"{metadata.feature_count:,}", metadata.crs)
+            write_schema_documentation(output_dir, metadata)
+            LOGGER.info(
+                "Source layer %s: %s Point records, CRS %s",
+                metadata.layer_name,
+                f"{metadata.feature_count:,}",
+                metadata.crs,
+            )
             reports = ReportStore()
-            inventory, variants, duplicate_nguids = read_inventory(gdb_path, metadata.feature_count, reports)
+            inventory, variants, inventory_counts, duplicate_nguids = read_inventory(
+                gdb_path, metadata.feature_count, reports
+            )
             del inventory
             gc.collect()
-            adapter = WisconsinStatewideNG911Adapter(gdb_path, metadata, config, variants, duplicate_nguids)
-            counties_to_process = config.counties or tuple(county for county in WI_COUNTIES if variants[county])
+
+            if config.resume or config.validate_only:
+                load_existing_reports(output_dir, reports)
+            existing_manifest = load_existing_manifest(output_dir)
+            adapter = WisconsinStatewideNG911Adapter(
+                gdb_path, metadata, config, variants, duplicate_nguids
+            )
+            counties_to_process = config.counties or tuple(
+                county for county in WI_COUNTIES if variants[county]
+            )
+            requested_for_manifest = tuple() if config.schema_report else tuple(counties_to_process)
             outcomes: dict[str, CountyOutput] = {}
-            for county in counties_to_process:
-                if not variants[county]:
-                    LOGGER.warning("Skipping %s: absent from source", county)
-                    continue
-                try:
-                    output = process_county(county, adapter, config, reports)
-                    outcomes[county] = output
-                    add_county_summary_row(reports, output)
+            failed_counties: set[str] = set()
+            skipped_counties: set[str] = set()
+
+            if not config.schema_report:
+                total_counties = len(counties_to_process)
+                for position, county in enumerate(counties_to_process, start=1):
+                    total_elapsed = time.perf_counter() - run_started_perf
                     LOGGER.info(
-                        "%s complete: source=%s runtime=%s quarantine=%s",
+                        "[%s/%s] Starting %s County (total elapsed %.1fs)",
+                        position,
+                        total_counties,
                         county,
-                        f"{output.source_count:,}",
-                        f"{output.runtime_count:,}",
-                        f"{output.quarantine_count:,}",
+                        total_elapsed,
                     )
-                except Exception as exc:  # county-isolated failure by design
-                    LOGGER.exception("%s County failed: %s", county, exc)
-                    reports.failures.append({
-                        "county": county,
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                        "timestamp_utc": utc_now_iso(),
-                    })
-                    if config.fail_fast:
-                        raise
-            manifest_rows = build_manifest(metadata, config, variants, outcomes)
-            previous_warnings = compare_previous_manifest(manifest_rows, config.previous_manifest) if config.previous_manifest else []
-            write_reports(output_dir, reports, metadata, config, manifest_rows, outcomes, previous_warnings)
+                    if not variants[county]:
+                        LOGGER.warning("%s County is absent from the statewide source; no county files were generated", county)
+                        continue
+
+                    reprocess_invalid_resume = False
+                    if config.resume or config.validate_only:
+                        try:
+                            existing_output = validate_existing_county_output(
+                                county,
+                                config,
+                                metadata,
+                                inventory_counts[county],
+                                reports,
+                                existing_manifest,
+                            )
+                            outcomes[county] = existing_output
+                            skipped_counties.add(county)
+                            if not any(row.get("county") == county for row in reports.county_summary):
+                                add_county_summary_row(reports, existing_output, inventory_counts[county])
+                            LOGGER.info(
+                                "%s County existing outputs validated; county processing skipped",
+                                county,
+                            )
+                            continue
+                        except Exception as exc:
+                            if config.validate_only:
+                                LOGGER.exception("%s County existing-output validation failed: %s", county, exc)
+                                record_failure(reports, county, "validate_existing_outputs", exc)
+                                failed_counties.add(county)
+                                if config.fail_fast:
+                                    raise
+                                continue
+                            LOGGER.warning(
+                                "%s County existing outputs are missing or invalid and will be rebuilt: %s",
+                                county,
+                                exc,
+                            )
+                            remove_county_report_rows(reports, county)
+                            reprocess_invalid_resume = True
+
+                    try:
+                        output = process_county(
+                            county,
+                            adapter,
+                            config,
+                            reports,
+                            inventory_counts[county],
+                            overwrite_existing=reprocess_invalid_resume,
+                        )
+                        outcomes[county] = output
+                        add_county_summary_row(reports, output, inventory_counts[county])
+                        if output.metrics.get("_full_fidelity_columns"):
+                            write_schema_documentation(
+                                output_dir,
+                                metadata,
+                                output.metrics["_full_fidelity_columns"],
+                            )
+                        LOGGER.info(
+                            "%s complete: source=%s runtime=%s quarantine=%s runtime_reduction=%s%% elapsed=%.1fs",
+                            county,
+                            f"{output.source_count:,}",
+                            f"{output.runtime_count:,}",
+                            f"{output.quarantine_count:,}",
+                            output.metrics.get("runtime_size_reduction_pct"),
+                            float(output.metrics.get("elapsed_processing_seconds") or 0),
+                        )
+                    except Exception as exc:  # county-isolated failure by design
+                        LOGGER.exception("%s County failed: %s", county, exc)
+                        record_failure(reports, county, "process_county", exc)
+                        failed_counties.add(county)
+                        if config.fail_fast:
+                            raise
+                    finally:
+                        remaining = total_counties - position
+                        LOGGER.info(
+                            "Progress: successes=%s failures=%s skipped=%s remaining=%s total_elapsed=%.1fs",
+                            len(outcomes),
+                            len(failed_counties),
+                            len(skipped_counties),
+                            remaining,
+                            time.perf_counter() - run_started_perf,
+                        )
+                        gc.collect()
+            else:
+                LOGGER.info("Schema-report mode: documentation generated; county processing skipped")
+
+            manifest_rows = build_manifest(
+                metadata,
+                config,
+                variants,
+                inventory_counts,
+                outcomes,
+                failed_counties,
+                requested_for_manifest,
+            )
+            previous_warnings = (
+                compare_previous_manifest(manifest_rows, config.previous_manifest)
+                if config.previous_manifest else []
+            )
+            run_ended_utc = utc_now_iso()
+            elapsed_seconds = time.perf_counter() - run_started_perf
+            write_reports(
+                output_dir,
+                reports,
+                metadata,
+                config,
+                manifest_rows,
+                outcomes,
+                previous_warnings,
+                inventory_counts,
+                requested_for_manifest,
+                run_started_utc,
+                run_ended_utc,
+                elapsed_seconds,
+            )
             failed = bool(reports.failures)
             LOGGER.info(
-                "Pipeline complete: %s successful county file set(s), %s failure(s)",
-                len(outcomes), len(reports.failures),
+                "Pipeline complete: %s successful/validated county file set(s), %s failure(s), %s resume skip(s), elapsed %.1fs",
+                len(outcomes),
+                len(reports.failures),
+                len(skipped_counties),
+                elapsed_seconds,
             )
             return 2 if failed else 0
         finally:
