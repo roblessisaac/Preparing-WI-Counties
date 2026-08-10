@@ -423,6 +423,9 @@ class PipelineConfig:
     row_group_size: int
     previous_manifest: Path | None
     fail_fast: bool
+    release_version: str
+    create_publish_package: bool
+    include_candidates_in_publish: bool
     wisconsin_bounds: tuple[float, float, float, float] = DEFAULT_WISCONSIN_BOUNDS
 
 
@@ -929,6 +932,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--row-group-size", type=int, default=DEFAULT_ROW_GROUP_SIZE)
     parser.add_argument("--previous-manifest", type=Path)
     parser.add_argument("--fail-fast", action="store_true")
+    parser.add_argument(
+        "--release-version",
+        help="Release label used in publish metadata and ZIP name (default: vYYYY.MM.DD)",
+    )
+    parser.add_argument(
+        "--no-publish-package",
+        action="store_true",
+        help="Skip creation of the Cloudflare-ready publish directory and ZIP",
+    )
+    parser.add_argument(
+        "--include-candidates-in-publish",
+        action="store_true",
+        help="Also copy technically valid statewide runtime candidates that are not yet publicly approved",
+    )
     args = parser.parse_args(argv)
     if args.runtime_only and args.full_fidelity_only:
         parser.error("--runtime-only and --full-fidelity-only are mutually exclusive")
@@ -3373,6 +3390,204 @@ def write_reports(
     atomic_write_json(output_dir / "source_metadata" / "analyzer_compatibility_notes.json", compatibility_notes)
 
 
+
+def create_cloudflare_publish_package(
+    output_dir: Path,
+    manifest_rows: Sequence[Mapping[str, Any]],
+    metadata: SourceMetadata,
+    config: PipelineConfig,
+) -> dict[str, Any]:
+    """Create a deterministic Cloudflare-ready publication directory and ZIP.
+
+    Strict mode publishes only counties whose statewide runtime is explicitly
+    approved. Candidate mode may additionally include technically valid
+    statewide runtime candidates, but their manifest rows remain disabled.
+    County overrides, incomplete counties, unavailable counties, and failed
+    outputs are never copied into the publish runtime directory.
+    """
+    release_version = normalize_whitespace(config.release_version)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", release_version):
+        raise PipelineError(
+            "--release-version may contain only letters, numbers, periods, underscores, and hyphens"
+        )
+
+    publish_dir = output_dir / "publish"
+    staging_dir = output_dir / f".publish_staging_{os.getpid()}"
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    runtime_dir = ensure_directory(staging_dir / "runtime")
+    manifests_dir = ensure_directory(staging_dir / "manifests")
+    metadata_dir = ensure_directory(staging_dir / "metadata")
+
+    enriched_rows: list[dict[str, Any]] = []
+    approved_counties: list[str] = []
+    candidate_counties: list[str] = []
+    blocked_counties: list[str] = []
+    checksum_rows: list[tuple[str, str]] = []
+
+    try:
+        for source_row in manifest_rows:
+            row = dict(source_row)
+            county = str(row.get("canonical_county") or "")
+            runtime_relative = row.get("runtime_relative_path")
+            technical_ok = row.get("technical_validation_status") in {
+                "validated", "validated_with_warnings"
+            }
+            approved = (
+                technical_ok
+                and bool(row.get("validation_passed"))
+                and row.get("production_source_status") == "statewide_runtime"
+                and row.get("public_availability_status") == "validated"
+            )
+            candidate = (
+                technical_ok
+                and bool(row.get("validation_passed"))
+                and row.get("production_source_status") == "statewide_runtime_candidate"
+            )
+            include = approved or (
+                config.include_candidates_in_publish and candidate
+            )
+
+            published_relative: str | None = None
+            published_sha256: str | None = None
+            published_size: int | None = None
+            analyzer_enabled = approved
+
+            if include and runtime_relative:
+                source_path = output_dir / str(runtime_relative)
+                if not source_path.exists():
+                    raise ValidationError(
+                        f"Publish source is missing for {county}: {runtime_relative}"
+                    )
+                destination_name = f"wi_{county_slug(county)}_runtime.parquet"
+                destination_path = runtime_dir / destination_name
+                shutil.copy2(source_path, destination_path)
+                source_hash = sha256_file(source_path)
+                copied_hash = sha256_file(destination_path)
+                if source_hash != copied_hash:
+                    raise ValidationError(
+                        f"Publish copy hash mismatch for {county}"
+                    )
+                published_relative = f"runtime/{destination_name}"
+                published_sha256 = copied_hash
+                published_size = destination_path.stat().st_size
+                checksum_rows.append((copied_hash, published_relative))
+                if approved:
+                    approved_counties.append(county)
+                else:
+                    candidate_counties.append(county)
+            elif runtime_relative:
+                blocked_counties.append(county)
+
+            row.update({
+                "analyzer_enabled": analyzer_enabled,
+                "included_in_publish_package": include,
+                "published_runtime_relative_path": published_relative,
+                "published_runtime_sha256": published_sha256,
+                "published_runtime_byte_size": published_size,
+            })
+            enriched_rows.append(row)
+
+        release_payload = {
+            "release_version": release_version,
+            "generated_at_utc": utc_now_iso(),
+            "source_system": SOURCE_SYSTEM,
+            "source_version": (
+                metadata.source_timestamp[:10]
+                if metadata.source_timestamp
+                else config.as_of_date.isoformat()
+            ),
+            "source_sha256": metadata.source_sha256,
+            "pipeline_version": PIPELINE_VERSION,
+            "runtime_schema_version": RUNTIME_SCHEMA_VERSION,
+            "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
+            "classification_rule_version": CLASSIFICATION_RULE_VERSION,
+            "publication_mode": (
+                "approved_and_candidates"
+                if config.include_candidates_in_publish
+                else "approved_only"
+            ),
+            "approved_counties": sorted(approved_counties),
+            "candidate_counties_included": sorted(candidate_counties),
+            "counties_with_runtime_not_published": sorted(blocked_counties),
+            "approved_county_count": len(approved_counties),
+            "candidate_county_count": len(candidate_counties),
+            "runtime_file_count": len(approved_counties) + len(candidate_counties),
+            "manifest_path": "manifests/wi_county_manifest.json",
+            "runtime_base_path": "runtime/",
+        }
+        manifest_payload = {
+            "release": release_payload,
+            "counties": enriched_rows,
+        }
+        atomic_write_json(
+            manifests_dir / "wi_county_manifest.json", manifest_payload
+        )
+        publish_manifest_columns = tuple(MANIFEST_COLUMNS) + (
+            "analyzer_enabled",
+            "included_in_publish_package",
+            "published_runtime_relative_path",
+            "published_runtime_sha256",
+            "published_runtime_byte_size",
+        )
+        atomic_write_csv(
+            manifests_dir / "wi_county_manifest.csv",
+            enriched_rows,
+            publish_manifest_columns,
+        )
+        atomic_write_json(metadata_dir / "release.json", release_payload)
+
+        for relative_path in (
+            "manifests/wi_county_manifest.json",
+            "manifests/wi_county_manifest.csv",
+            "metadata/release.json",
+        ):
+            file_path = staging_dir / relative_path
+            checksum_rows.append((sha256_file(file_path), relative_path))
+        checksum_rows.sort(key=lambda item: item[1])
+        checksums_path = metadata_dir / "checksums.sha256"
+        checksums_path.write_text(
+            "".join(f"{digest}  {relative}\n" for digest, relative in checksum_rows),
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        if publish_dir.exists():
+            shutil.rmtree(publish_dir)
+        os.replace(staging_dir, publish_dir)
+
+        zip_base = output_dir / f"territorytoolbox_publish_{release_version}"
+        zip_path = Path(str(zip_base) + ".zip")
+        zip_path.unlink(missing_ok=True)
+        archive_path = Path(
+            shutil.make_archive(
+                str(zip_base),
+                "zip",
+                root_dir=publish_dir,
+                base_dir=".",
+            )
+        )
+        zip_hash = sha256_file(archive_path)
+        summary = {
+            **release_payload,
+            "publish_directory": portable_relative_path(publish_dir, output_dir),
+            "publish_zip": portable_relative_path(archive_path, output_dir),
+            "publish_zip_byte_size": archive_path.stat().st_size,
+            "publish_zip_sha256": zip_hash,
+        }
+        atomic_write_json(output_dir / "reports" / "publish_summary.json", summary)
+        LOGGER.info(
+            "Cloudflare publish package created: %s approved, %s candidate, ZIP=%s",
+            len(approved_counties),
+            len(candidate_counties),
+            archive_path.name,
+        )
+        return summary
+    finally:
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
+
+
 def add_county_summary_row(
     reports: ReportStore,
     output: CountyOutput,
@@ -3483,6 +3698,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             row_group_size=args.row_group_size,
             previous_manifest=args.previous_manifest.expanduser().resolve() if args.previous_manifest else None,
             fail_fast=args.fail_fast,
+            release_version=(args.release_version or f"v{date.today():%Y.%m.%d}"),
+            create_publish_package=not args.no_publish_package,
+            include_candidates_in_publish=args.include_candidates_in_publish,
         )
         LOGGER.info(
             "Starting Wisconsin NG911 pipeline v%s (runtime schema %s)",
@@ -3650,6 +3868,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 run_ended_utc,
                 elapsed_seconds,
             )
+            if config.create_publish_package and not config.schema_report:
+                create_cloudflare_publish_package(
+                    output_dir, manifest_rows, metadata, config
+                )
             failed = bool(reports.failures)
             LOGGER.info(
                 "Pipeline complete: %s successful/validated county file set(s), %s failure(s), %s resume skip(s), elapsed %.1fs",
